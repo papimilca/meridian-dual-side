@@ -454,6 +454,7 @@ export async function deployPosition({
   amount_sol, // legacy: will be used as amount_y if amount_y is not provided
   amount_x,
   amount_y,
+  amount_x_sol, // NEW: SOL value to swap to token X before deploying (imbalanced zap-in)
   strategy,
   bins_below,
   bins_above,
@@ -496,6 +497,61 @@ export async function deployPosition({
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
   }
+
+  // ─── Imbalanced Zap-In: Swap SOL → Token X first ───────────────
+  let swappedTokenAmount = 0;
+  let totalSolUsed = 0;
+  let swapPerformed = false;
+  let swapDetails = null;
+  
+  try {
+    if (amount_x_sol != null && Number(amount_x_sol) > 0) {
+      const solToSwap = Number(amount_x_sol);
+      if (!Number.isFinite(solToSwap) || solToSwap <= 0) {
+        throw new Error(`Invalid amount_x_sol: must be a positive number (got ${amount_x_sol})`);
+      }
+      
+      log("deploy", `Imbalanced zap-in: swapping ${solToSwap} SOL → ${baseMint.slice(0, 8)} first`);
+      
+      const { swapToken } = await import("./wallet.js");
+      const swapResult = await swapToken({
+        input_mint: "SOL",
+        output_mint: baseMint,
+        amount: solToSwap,
+      });
+      
+      if (!swapResult.success) {
+        throw new Error(`Pre-deploy swap failed: ${swapResult.error}`);
+      }
+      
+      // Get actual token amount received from swap
+      const connection = getConnection();
+      const mintInfo = await connection.getParsedAccountInfo(new PublicKey(baseMint));
+      const tokenDecimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
+      swappedTokenAmount = Number(swapResult.amount_out) / Math.pow(10, tokenDecimals);
+      
+      log("deploy", `Swap successful: received ${swappedTokenAmount} tokens (tx: ${swapResult.tx})`);
+      
+      // Mark swap as performed for rollback tracking
+      swapPerformed = true;
+      swapDetails = {
+        solAmount: solToSwap,
+        tokenAmount: swappedTokenAmount,
+        tokenMint: baseMint,
+        tokenDecimals,
+        tx: swapResult.tx,
+      };
+      
+      // Override amount_x with swapped amount
+      amount_x = swappedTokenAmount;
+      totalSolUsed += solToSwap;
+    }
+  } catch (swapError) {
+    // If swap itself fails, reject immediately without trying deploy
+    log("deploy_error", `Imbalanced zap-in swap failed: ${swapError.message}`);
+    return { success: false, error: `Pre-deploy swap failed: ${swapError.message}` };
+  }
+  
   const activeBin = await pool.getActiveBin();
   const actualBinStep = pool.lbPair.binStep;
   const activePrice = Number(getPriceOfBinByBinId(activeBin.binId, actualBinStep).toString());
@@ -539,16 +595,21 @@ export async function deployPosition({
       : 0;
   const finalAmountY = Number(amount_y ?? amount_sol ?? fallbackAmountY);
   const finalAmountX = Number(amount_x ?? 0);
+  
+  // Track total SOL used (for imbalanced zap-in)
+  totalSolUsed += finalAmountY;
+  
   if (!Number.isFinite(finalAmountY) || !Number.isFinite(finalAmountX) || finalAmountY < 0 || finalAmountX < 0) {
     throw new Error("Invalid deploy amount: amount_x and amount_y must be valid non-negative numbers.");
   }
-  if (finalAmountX > 0) {
-    throw new Error("Unsupported deploy amount: this agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.");
-  }
-  if (finalAmountY <= 0) {
-    throw new Error("Invalid deploy amount: provide a positive amount_y/amount_sol.");
+  if (finalAmountY <= 0 && finalAmountX <= 0) {
+    throw new Error("Invalid deploy amount: provide at least one positive amount (amount_x or amount_y/amount_sol).");
   }
   const isSingleSidedSol = finalAmountX <= 0 && finalAmountY > 0;
+  const isSingleSidedX = finalAmountX > 0 && finalAmountY <= 0;
+  const isImbalanced = finalAmountX > 0 && finalAmountY > 0;
+  
+  // For single-sided SOL deploys, restrict upside exposure
   if (isSingleSidedSol && (Number(bins_above ?? 0) > 0 || Number(upside_pct ?? 0) > 0)) {
     throw new Error(
       "Single-side SOL deploy cannot use bins_above or upside_pct. Use amount_y with bins_below only; the upper bin is the SDK active bin.",
@@ -556,6 +617,13 @@ export async function deployPosition({
   }
   if (isSingleSidedSol) {
     activeBinsAbove = 0;
+  }
+  
+  // For imbalanced positions, require explicit bin range specification
+  if (isImbalanced && bins_below == null && bins_above == null && downside_pct == null && upside_pct == null) {
+    throw new Error(
+      "Imbalanced position (both amount_x and amount_y specified) requires explicit range: provide bins_below/bins_above or downside_pct/upside_pct.",
+    );
   }
   activeBinsBelow = Number(activeBinsBelow);
   activeBinsAbove = Number(activeBinsAbove);
@@ -588,6 +656,11 @@ export async function deployPosition({
         upside_pct: upside_pct ?? null,
         amount_x: finalAmountX,
         amount_y: finalAmountY,
+        total_sol_used: totalSolUsed > 0 ? totalSolUsed : finalAmountY,
+        pre_swap: amount_x_sol != null ? {
+          would_swap_sol: amount_x_sol,
+          to_token: baseMint,
+        } : null,
         wide_range: totalBins > 69,
       },
       message: "DRY RUN — no transaction sent",
@@ -759,6 +832,12 @@ export async function deployPosition({
         wide_range: isWideRange,
         amount_x: finalAmountX,
         amount_y: finalAmountY,
+        total_sol_used: totalSolUsed > 0 ? totalSolUsed : finalAmountY,
+        pre_swap: swappedTokenAmount > 0 ? {
+          sol_swapped: amount_x_sol,
+          tokens_received: swappedTokenAmount,
+          token_mint: baseMint,
+        } : null,
         txs: normalizeExecutionSignatures(submit),
       };
     } catch (error) {
@@ -898,10 +977,150 @@ export async function deployPosition({
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,
+      total_sol_used: totalSolUsed > 0 ? totalSolUsed : finalAmountY,
+      pre_swap: swappedTokenAmount > 0 ? {
+        sol_swapped: amount_x_sol,
+        tokens_received: swappedTokenAmount,
+        token_mint: baseMint,
+      } : null,
       txs: txHashes,
     };
   } catch (error) {
     log("deploy_error", error.message);
+    
+    // ─── Check for Partial Position Creation ───
+    let partialPositionWarning = null;
+    try {
+      const positionAccount = await getConnection().getAccountInfo(newPosition.publicKey);
+      if (positionAccount) {
+        log("deploy_warn", `Partial position detected: ${newPosition.publicKey.toString()} exists on-chain but deploy failed. This position may contain partial liquidity.`);
+        partialPositionWarning = {
+          position_address: newPosition.publicKey.toString(),
+          message: `Deploy failed but a partial position was created at ${newPosition.publicKey.toString()}. Check and close it manually to recover any deposited funds.`,
+        };
+      }
+    } catch (checkError) {
+      // Non-blocking: if we can't check, just continue
+      log("deploy_warn", `Could not check for partial position: ${checkError.message}`);
+    }
+    
+    // ─── Rollback: Swap tokens back to SOL if deploy failed after successful swap ───
+    if (swapPerformed && swapDetails) {
+      try {
+        // Check actual token balance in wallet before rollback
+        // Some tokens may have been deposited in partial addLiquidity txs
+        const wallet = getWallet();
+        let actualBalance = 0;
+        try {
+          const tokenAccounts = await getConnection().getParsedTokenAccountsByOwner(
+            wallet.publicKey,
+            { mint: new PublicKey(swapDetails.tokenMint) }
+          );
+          if (tokenAccounts.value.length > 0) {
+            const accountInfo = tokenAccounts.value[0].account.data.parsed.info;
+            actualBalance = parseFloat(accountInfo.tokenAmount.uiAmount || 0);
+          }
+        } catch (balanceError) {
+          log("deploy_rollback", `Could not fetch token balance: ${balanceError.message}, assuming 0`);
+          actualBalance = 0;
+        }
+        
+        const tokensDeposited = swapDetails.tokenAmount - actualBalance;
+        
+        if (actualBalance <= 0) {
+          log("deploy_rollback", `No tokens left in wallet to rollback (${swapDetails.tokenAmount} tokens were fully deposited in partial position)`);
+          return {
+            success: false,
+            error: error.message,
+            partial_position: partialPositionWarning,
+            rollback: {
+              performed: false,
+              reason: "no_tokens_in_wallet",
+              tokens_deposited: swapDetails.tokenAmount,
+              message: `Deploy failed. All ${swapDetails.tokenAmount} swapped tokens were deposited into the partial position. Close position to recover funds.`,
+            },
+          };
+        }
+        
+        if (tokensDeposited > 0) {
+          log("deploy_rollback", `Detected partial deposit: ${tokensDeposited.toFixed(6)} tokens already in position, ${actualBalance.toFixed(6)} tokens remaining in wallet`);
+        }
+        
+        log("deploy_rollback", `Deploy failed after successful swap — attempting to swap ${actualBalance} tokens back to SOL`);
+        
+        const { swapToken } = await import("./wallet.js");
+        const rollbackResult = await swapToken({
+          input_mint: swapDetails.tokenMint,
+          output_mint: "SOL",
+          amount: actualBalance,
+        });
+        
+        if (rollbackResult.success) {
+          const partialDepositNote = tokensDeposited > 0 
+            ? ` ${tokensDeposited.toFixed(6)} tokens were already deposited in the partial position.`
+            : "";
+          log("deploy_rollback", `Rollback successful: swapped ${actualBalance} tokens → ${rollbackResult.amount_out} SOL (tx: ${rollbackResult.tx})`);
+          return {
+            success: false,
+            error: error.message,
+            partial_position: partialPositionWarning,
+            rollback: {
+              performed: true,
+              success: true,
+              original_swap_tx: swapDetails.tx,
+              rollback_tx: rollbackResult.tx,
+              sol_recovered: rollbackResult.amount_out,
+              tokens_swapped_back: actualBalance,
+              tokens_deposited: tokensDeposited > 0 ? tokensDeposited : null,
+              message: `Deploy failed but ${actualBalance} tokens were rolled back successfully. ${rollbackResult.amount_out} SOL recovered.${partialDepositNote}`,
+            },
+          };
+        } else {
+          log("deploy_rollback", `Rollback swap failed: ${rollbackResult.error}`);
+          return {
+            success: false,
+            error: error.message,
+            partial_position: partialPositionWarning,
+            rollback: {
+              performed: true,
+              success: false,
+              error: rollbackResult.error,
+              original_swap_tx: swapDetails.tx,
+              tokens_stuck: actualBalance,
+              tokens_deposited: tokensDeposited > 0 ? tokensDeposited : null,
+              token_mint: swapDetails.tokenMint,
+              message: `Deploy failed AND rollback swap failed. ${actualBalance} tokens of ${swapDetails.tokenMint} are stuck in wallet.${tokensDeposited > 0 ? ` ${tokensDeposited} tokens were deposited in partial position.` : ""}`,
+            },
+          };
+        }
+      } catch (rollbackError) {
+        log("deploy_rollback", `Rollback attempt crashed: ${rollbackError.message}`);
+        return {
+          success: false,
+          error: error.message,
+          partial_position: partialPositionWarning,
+          rollback: {
+            performed: true,
+            success: false,
+            error: rollbackError.message,
+            original_swap_tx: swapDetails.tx,
+            tokens_stuck: swapDetails.tokenAmount,
+            token_mint: swapDetails.tokenMint,
+            message: `Deploy failed AND rollback crashed. ${swapDetails.tokenAmount} tokens of ${swapDetails.tokenMint} may be stuck in wallet or partial position.`,
+          },
+        };
+      }
+    }
+    
+    // Return error with partial position warning if no swap rollback was needed
+    if (partialPositionWarning) {
+      return {
+        success: false,
+        error: error.message,
+        partial_position: partialPositionWarning,
+      };
+    }
+    
     return { success: false, error: error.message };
   }
 }
@@ -1610,41 +1829,42 @@ export async function closePosition({ position_address, reason }) {
 
       recordClose(position_address, reason || "agent decision");
 
+      // Fetch PnL from Meteora API (works regardless of tracking status)
+      let pnlUsd = 0;
+      let pnlTrueUsd = 0;
+      let pnlPct = 0;
+      let finalValueUsd = 0;
+      let initialUsd = 0;
+      let feesUsd = tracked?.total_fees_claimed_usd || 0;
+      try {
+        const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
+        for (let attempt = 0; attempt < 6; attempt++) {
+          const res = await fetch(closedUrl);
+          if (res.ok) {
+            const data = await res.json();
+            const posEntry = (data.positions || []).find((entry) => entry.positionAddress === position_address);
+            if (posEntry) {
+              pnlTrueUsd = safeNum(posEntry.pnlUsd);
+              pnlUsd = config.management.solMode ? getClosedPnlValue(posEntry, true) : pnlTrueUsd;
+              pnlPct = getClosedPnlPct(posEntry, config.management.solMode);
+              finalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
+              initialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
+              feesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
+              break;
+            }
+          }
+          if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, 5000));
+        }
+      } catch (e) {
+        log("close_warn", `Relay closed PnL fetch failed: ${e.message}`);
+      }
+
       if (tracked) {
         const deployedAt = new Date(tracked.deployed_at).getTime();
         const minutesHeld = Math.floor((Date.now() - deployedAt) / 60000);
         let minutesOOR = 0;
         if (tracked.out_of_range_since) {
           minutesOOR = Math.floor((Date.now() - new Date(tracked.out_of_range_since).getTime()) / 60000);
-        }
-
-        let pnlUsd = 0;
-        let pnlTrueUsd = 0;
-        let pnlPct = 0;
-        let finalValueUsd = 0;
-        let initialUsd = 0;
-        let feesUsd = tracked.total_fees_claimed_usd || 0;
-        try {
-          const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
-          for (let attempt = 0; attempt < 6; attempt++) {
-            const res = await fetch(closedUrl);
-            if (res.ok) {
-              const data = await res.json();
-              const posEntry = (data.positions || []).find((entry) => entry.positionAddress === position_address);
-              if (posEntry) {
-                pnlTrueUsd = safeNum(posEntry.pnlUsd);
-                pnlUsd = config.management.solMode ? getClosedPnlValue(posEntry, true) : pnlTrueUsd;
-                pnlPct = getClosedPnlPct(posEntry, config.management.solMode);
-                finalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
-                initialUsd = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
-                feesUsd = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
-                break;
-              }
-            }
-            if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, 5000));
-          }
-        } catch (e) {
-          log("close_warn", `Relay closed PnL fetch failed: ${e.message}`);
         }
 
         const closeBaseMint = livePosition?.base_mint || pool.lbPair.tokenXMint.toString();
@@ -1726,6 +1946,9 @@ export async function closePosition({ position_address, reason }) {
           txs: txHashes,
           pnl_usd: pnlUsd,
           pnl_pct: pnlPct,
+          initial_value_usd: initialUsd,
+          final_value_usd: finalValueUsd,
+          fees_usd: feesUsd,
           base_mint: closeBaseMint,
         };
       }
@@ -1736,9 +1959,13 @@ export async function closePosition({ position_address, reason }) {
         pool: poolAddress,
         pool_name: poolMeta.name || poolAddress.slice(0, 8),
         position: position_address,
-        summary: "Relay closed position",
+        summary: `Relay closed at ${pnlPct.toFixed(2)}%`,
         reason: reason || "agent decision",
-        metrics: {},
+        metrics: {
+          pnl_usd: pnlUsd,
+          pnl_pct: pnlPct,
+          fees_usd: feesUsd,
+        },
       });
 
       return {
@@ -1752,6 +1979,11 @@ export async function closePosition({ position_address, reason }) {
         close_txs: closeTxHashes,
         txs: txHashes,
         base_mint: livePosition?.base_mint || null,
+        pnl_usd: pnlUsd,
+        pnl_pct: pnlPct,
+        initial_value_usd: initialUsd,
+        final_value_usd: finalValueUsd,
+        fees_usd: feesUsd,
       };
       } catch (relayError) {
         if (relaySubmitted) throw relayError;

@@ -138,11 +138,15 @@ HARD RULES:
 - Range must cover at least 35 total bins. Never deploy 1-bin/tiny ranges.
 - For single-side SOL deploys (amount_y only, amount_x=0), do not request upside exposure:
   use bins_below only, keep bins_above=0, and the upper bin will be pinned to the current active bin.
+- For imbalanced positions (both amount_x and amount_y), you MUST specify explicit bin range via bins_below/bins_above or downside_pct/upside_pct.
 
 Guidelines (only when user hasn't specified):
 - Strategy: omit the strategy field — the system will use the configured default from config.strategy.strategy
 - Bins: choose from configured minBinsBelow/maxBinsBelow by positive volatility. The hard lower floor is 35 bins.
-- Deposit: single-sided SOL only: set amount_y/amount_sol, keep amount_x=0.
+- Deposit modes:
+  * Single-sided SOL: set amount_y/amount_sol, keep amount_x=0 (most common)
+  * Single-sided X token: set amount_x, keep amount_y=0
+  * Imbalanced (both tokens): set both amount_x and amount_y with explicit bin range
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       parameters: {
@@ -158,7 +162,11 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           amount_x: {
             type: "number",
-            description: "Unsupported for this agent. Keep at 0; deploys are single-side SOL via amount_y."
+            description: "Amount of base token (token X) to deposit directly. For advanced use only. Most users should use amount_x_sol instead for automatic zap-in."
+          },
+          amount_x_sol: {
+            type: "number",
+            description: "SOL amount to swap to token X before deploying (imbalanced zap-in). System will: 1) swap this SOL amount to token X via Jupiter, 2) deploy with swapped tokens + amount_y. Total SOL used = amount_x_sol + amount_y. Requires explicit bin range (bins_below/bins_above)."
           },
           amount_sol: {
             type: "number",

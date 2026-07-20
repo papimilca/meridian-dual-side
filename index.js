@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
-import { getWalletBalances } from "./tools/wallet.js";
+import { getWalletBalances, swapToken } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
@@ -21,6 +21,7 @@ import {
   editMessageWithButtons,
   answerCallbackQuery,
   notifyOutOfRange,
+  notifyCloseDetailed,
   isEnabled as telegramEnabled,
   createLiveMessage,
 } from "./telegram.js";
@@ -293,13 +294,43 @@ export async function runManagementCycle({ silent = false } = {}) {
     const totalValue = positionData.reduce((s, p) => s + (p.total_value_usd ?? 0), 0);
     const totalUnclaimed = positionData.reduce((s, p) => s + (p.unclaimed_fees_usd ?? 0), 0);
 
+    // Pre-fetch pool metadata for positions with missing pair names
+    const poolMetaMap = new Map();
+    const positionsNeedingMeta = positionData.filter(p => 
+      !p.pair || p.pair === "?/SOL" || !getTrackedPosition(p.position)?.pool_name
+    );
+    
+    if (positionsNeedingMeta.length > 0) {
+      await Promise.all(positionsNeedingMeta.map(async (p) => {
+        try {
+          const res = await fetch(`https://dlmm.datapi.meteora.ag/pools/${p.pool}`);
+          if (res.ok) {
+            const data = await res.json();
+            const tokenX = data?.token_x?.symbol || data?.mint_x_symbol || null;
+            const tokenY = data?.token_y?.symbol || data?.mint_y_symbol || "SOL";
+            const name = data?.name || (tokenX && tokenY ? `${tokenX}-${tokenY}` : null);
+            if (name) poolMetaMap.set(p.pool, name);
+          }
+        } catch (e) {
+          log("mgmt_warn", `Failed to fetch pool metadata for ${p.pool?.slice(0, 8)}: ${e.message}`);
+        }
+      }));
+    }
+
     const reportLines = positionData.map((p) => {
       const act = actionMap.get(p.position);
+      // Get proper pair name with multiple fallbacks
+      const tracked = getTrackedPosition(p.position);
+      let pairName = p.pair;
+      if (!pairName || pairName === "?/SOL") {
+        pairName = tracked?.pool_name || poolMetaMap.get(p.pool) || p.pair || "?/SOL";
+      }
+      
       const inRange = p.in_range ? "🟢 IN" : `🔴 OOR ${p.minutes_out_of_range ?? 0}m`;
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      let line = `**${pairName}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
@@ -417,8 +448,28 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Load active strategy
     const activeStrategy = getActiveStrategy();
     const deployStrategy = config.strategy.strategy;
-    const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | bins_above: 0 (FIXED — never change) | deposit: SOL only (amount_y, amount_x=0)`
-      + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "");
+    const dualSideEnabled = config.strategy.dualSide === true;
+    
+    // Extract composition guidance from strategy if available
+    const hasComposition = activeStrategy?.pool_selection?.composition;
+    const compositionGuidance = hasComposition
+      ? `\nCOMPOSITION GUIDANCE (REQUIRED): ${activeStrategy.pool_selection.composition}` 
+      : "";
+    
+    // Conditional deploy instructions based on dualSide config
+    const depositMode = dualSideEnabled
+      ? (hasComposition 
+          ? "deposit: Dual-sided/imbalanced REQUIRED per strategy composition (amount_x_sol + amount_y)"
+          : "deposit: Single-sided SOL (amount_y only, amount_x=0, bins_above=0) OR Dual-sided/imbalanced (amount_x_sol + amount_y with bins_above > 0 for symmetric range)")
+      : "deposit: SOL only (amount_y, amount_x=0) | bins_above: 0 (FIXED — never change)";
+    
+    const strategyBlock = `DEPLOY STRATEGY: ${deployStrategy} (from config) | ${depositMode}`
+      + (activeStrategy ? `\nSTRATEGY CONTEXT: ${activeStrategy.name} — entry: ${activeStrategy.entry?.condition || "n/a"} | exit: ${activeStrategy.exit?.notes || "n/a"} | best for: ${activeStrategy.best_for}` : "")
+      + compositionGuidance;
+    
+    if (hasComposition && dualSideEnabled) {
+      log("cron", `Composition guidance active: ${activeStrategy.pool_selection.composition}`);
+    }
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
     const topCandidates = await getTopCandidates({ limit: 10 }).catch(() => null);
@@ -583,8 +634,24 @@ STEPS:
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
    bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
-   For single-side SOL deploys, do not invent upside:
-   set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
+   ${dualSideEnabled 
+     ? (hasComposition
+         ? `DEPOSIT MODE (REQUIRED - composition specified):
+   - MUST use dual-sided/imbalanced deployment as specified in COMPOSITION GUIDANCE above
+   - Parse the composition string to extract amounts:
+     * Example: "~0.1 SOL-equivalent of token paired with ~0.4 SOL" means:
+       → Calculate ratio: 0.1/(0.1+0.4) = 0.2 (20% token, 80% SOL)
+       → Apply to deploy amount ${deployAmount} SOL:
+       → amount_x_sol = ${deployAmount} * 0.2 = ${(deployAmount * 0.2).toFixed(2)}
+       → amount_y = ${deployAmount} * 0.8 = ${(deployAmount * 0.8).toFixed(2)}
+   - Use downside_pct and upside_pct from strategy range specification (e.g., -80% downside, +30% upside)
+   - DO NOT use single-sided when composition guidance is present - this is MANDATORY`
+         : `DEPOSIT MODE (dualSide enabled - optional):
+   - Single-sided SOL (default): set amount_y only, keep amount_x=0 and amount_x_sol=0, keep bins_above=0
+   - Dual-sided/imbalanced (optional): set amount_x_sol + amount_y with bins_above > 0
+   - Use dual-sided only when pool characteristics clearly favor balanced exposure`)
+     : `For single-side SOL deploys, do not invent upside:
+   set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.`}
 4. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
@@ -1449,12 +1516,44 @@ async function telegramHandler(msg) {
     try {
       const { positions, total_positions } = await getMyPositions({ force: true });
       if (total_positions === 0) { await sendMessage("No open positions."); return; }
+      
+      // Pre-fetch pool metadata for positions with missing pair names
+      const poolMetaMap = new Map();
+      const positionsNeedingMeta = positions.filter(p => {
+        const tracked = getTrackedPosition(p.position);
+        return !p.pair || p.pair === "?/SOL" || !tracked?.pool_name;
+      });
+      
+      if (positionsNeedingMeta.length > 0) {
+        await Promise.all(positionsNeedingMeta.map(async (p) => {
+          try {
+            const res = await fetch(`https://dlmm.datapi.meteora.ag/pools/${p.pool}`);
+            if (res.ok) {
+              const data = await res.json();
+              const tokenX = data?.token_x?.symbol || data?.mint_x_symbol || null;
+              const tokenY = data?.token_y?.symbol || data?.mint_y_symbol || "SOL";
+              const name = data?.name || (tokenX && tokenY ? `${tokenX}-${tokenY}` : null);
+              if (name) poolMetaMap.set(p.pool, name);
+            }
+          } catch (e) {
+            log("telegram_warn", `Failed to fetch pool metadata for ${p.pool?.slice(0, 8)}: ${e.message}`);
+          }
+        }));
+      }
+      
       const cur = config.management.solMode ? "◎" : "$";
       const lines = positions.map((p, i) => {
+        // Get proper pair name with multiple fallbacks
+        const tracked = getTrackedPosition(p.position);
+        let pairName = p.pair;
+        if (!pairName || pairName === "?/SOL") {
+          pairName = tracked?.pool_name || poolMetaMap.get(p.pool) || p.pair || "?/SOL";
+        }
+        
         const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
         const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
         const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+        return `${i + 1}. ${pairName} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
       });
       await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
@@ -1491,16 +1590,95 @@ async function telegramHandler(msg) {
       const { positions } = await getMyPositions({ force: true });
       if (idx < 0 || idx >= positions.length) { await sendMessage("Invalid number. Use /positions first."); return; }
       const pos = positions[idx];
-      await sendMessage(`Closing ${pos.pair}...`);
-      const result = await closePosition({ position_address: pos.position });
+      const tracked = getTrackedPosition(pos.position);
+      
+      await sendMessage(`Closing ${pos.pair || tracked?.pool_name || "position"}...`);
+      const result = await closePosition({ position_address: pos.position, reason: "manual /close" });
+      
       if (result.success) {
-        const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
-        const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        // Auto-swap base token back to SOL (dual side position handling)
+        let swapAmount = null;
+        let swapSymbol = null;
+        if (result.base_mint && result.base_mint !== config.tokens.SOL) {
+          try {
+            const balances = await getWalletBalances({});
+            const token = balances.tokens?.find((t) => t.mint === result.base_mint);
+            if (token && token.usd >= 0.10) {
+              log("telegram", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} back to SOL after close`);
+              const swapResult = await swapToken({ 
+                input_mint: result.base_mint, 
+                output_mint: "SOL", 
+                amount: token.balance 
+              });
+              if (swapResult?.success !== false && !swapResult?.error && swapResult?.amount_out) {
+                swapAmount = swapResult.amount_out / 1e9; // Convert lamports to SOL
+                swapSymbol = token.symbol || "token";
+              }
+            }
+          } catch (swapErr) {
+            log("telegram_warn", `Auto-swap after close failed: ${swapErr.message}`);
+          }
+        }
+
+        // Prepare detailed notification data
+        const currency = config.management.solMode ? "◎" : "$";
+        const pairName = result.pool_name || pos.pair || tracked?.pool_name || "?/SOL";
+        const pnlValue = result.pnl_usd ?? 0;
+        const pnlPct = result.pnl_pct ?? 0;
+        
+        // Calculate initial and final amounts based on mode
+        let initialAmount, finalAmount, swapAmountDisplay;
+        if (config.management.solMode) {
+          // SOL mode: convert USD values from API to SOL
+          const wallet = await getWalletBalances({});
+          const solPriceUsd = wallet.sol_price ?? 1;
+          initialAmount = (result.initial_value_usd ?? 0) / solPriceUsd;
+          finalAmount = (result.final_value_usd ?? 0) / solPriceUsd;
+          swapAmountDisplay = swapAmount;
+        } else {
+          // USD mode: use values directly from API
+          initialAmount = result.initial_value_usd ?? 0;
+          finalAmount = result.final_value_usd ?? 0;
+          // Convert swap SOL amount to USD
+          if (swapAmount) {
+            const wallet = await getWalletBalances({});
+            const solPriceUsd = wallet.sol_price ?? 0;
+            swapAmountDisplay = swapAmount * solPriceUsd;
+          } else {
+            swapAmountDisplay = null;
+          }
+        }
+        
+        const netValue = pnlValue;
+        const netPct = pnlPct;
+        
+        // Calculate duration
+        const durationMinutes = tracked?.deployed_at 
+          ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
+          : null;
+
+        // Send detailed notification
+        await notifyCloseDetailed({
+          pair: pairName,
+          pnlUsd: pnlValue,
+          pnlPct: pnlPct,
+          feesUsd: tracked?.total_fees_claimed_usd ?? null,
+          swapAmount: swapAmountDisplay,
+          swapSymbol: swapSymbol,
+          netUsd: netValue,
+          netPct: netPct,
+          initialAmount: initialAmount,
+          finalAmount: finalAmount,
+          exitReason: "Manual close",
+          durationMinutes: durationMinutes,
+          currency: currency,
+        });
       } else {
-        await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
+        await sendMessage(`❌ Close failed: ${result.error || "unknown error"}`);
       }
-    } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+    } catch (e) { 
+      await sendMessage(`Error: ${e.message}`).catch(() => {}); 
+    }
     return;
   }
 
@@ -1509,16 +1687,112 @@ async function telegramHandler(msg) {
       const { positions } = await getMyPositions({ force: true });
       if (!positions.length) { await sendMessage("No open positions."); return; }
       await sendMessage(`Closing ${positions.length} position(s)...`);
+      
       const results = [];
+      let successCount = 0;
+      let failCount = 0;
+
       for (const pos of positions) {
         try {
-          const result = await closePosition({ position_address: pos.position });
-          results.push(`${pos.pair}: ${result.success ? "closed" : `failed (${result.error || "unknown"})`}`);
+          const tracked = getTrackedPosition(pos.position);
+          const pairName = pos.pair || tracked?.pool_name || "?/SOL";
+          
+          const result = await closePosition({ position_address: pos.position, reason: "manual /closeall" });
+          
+          if (result.success) {
+            successCount++;
+            
+            // Auto-swap base token back to SOL (dual side position handling)
+            let swapAmount = null;
+            let swapSymbol = null;
+            if (result.base_mint && result.base_mint !== config.tokens.SOL) {
+              try {
+                const balances = await getWalletBalances({});
+                const token = balances.tokens?.find((t) => t.mint === result.base_mint);
+                if (token && token.usd >= 0.10) {
+                  log("telegram", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} back to SOL after close`);
+                  const swapResult = await swapToken({ 
+                    input_mint: result.base_mint, 
+                    output_mint: "SOL", 
+                    amount: token.balance 
+                  });
+                  if (swapResult?.success !== false && !swapResult?.error && swapResult?.amount_out) {
+                    swapAmount = swapResult.amount_out / 1e9; // Convert lamports to SOL
+                    swapSymbol = token.symbol || "token";
+                  }
+                }
+              } catch (swapErr) {
+                log("telegram_warn", `Auto-swap after close failed: ${swapErr.message}`);
+              }
+            }
+
+            // Prepare detailed notification data
+            const currency = config.management.solMode ? "◎" : "$";
+            const pnlValue = result.pnl_usd ?? 0;
+            const pnlPct = result.pnl_pct ?? 0;
+            
+            // Calculate initial and final amounts based on mode
+            let initialAmount, finalAmount, swapAmountDisplay;
+            if (config.management.solMode) {
+              // SOL mode: convert USD values from API to SOL
+              const wallet = await getWalletBalances({});
+              const solPriceUsd = wallet.sol_price ?? 1;
+              initialAmount = (result.initial_value_usd ?? 0) / solPriceUsd;
+              finalAmount = (result.final_value_usd ?? 0) / solPriceUsd;
+              swapAmountDisplay = swapAmount;
+            } else {
+              // USD mode: use values directly from API
+              initialAmount = result.initial_value_usd ?? 0;
+              finalAmount = result.final_value_usd ?? 0;
+              // Convert swap SOL amount to USD
+              if (swapAmount) {
+                const wallet = await getWalletBalances({});
+                const solPriceUsd = wallet.sol_price ?? 0;
+                swapAmountDisplay = swapAmount * solPriceUsd;
+              } else {
+                swapAmountDisplay = null;
+              }
+            }
+            
+            const netValue = pnlValue;
+            const netPct = pnlPct;
+            
+            // Calculate duration
+            const durationMinutes = tracked?.deployed_at 
+              ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
+              : null;
+
+            // Send detailed notification for this position
+            await notifyCloseDetailed({
+              pair: result.pool_name || pairName,
+              pnlUsd: pnlValue,
+              pnlPct: pnlPct,
+              feesUsd: tracked?.total_fees_claimed_usd ?? null,
+              swapAmount: swapAmountDisplay,
+              swapSymbol: swapSymbol,
+              netUsd: netValue,
+              netPct: netPct,
+              initialAmount: initialAmount,
+              finalAmount: finalAmount,
+              exitReason: "Manual close-all",
+              durationMinutes: durationMinutes,
+              currency: currency,
+            });
+
+            results.push(`${result.pool_name || pairName}: closed ✅`);
+          } else {
+            failCount++;
+            results.push(`${pairName}: failed (${result.error || "unknown"}) ❌`);
+          }
         } catch (error) {
-          results.push(`${pos.pair}: failed (${error.message})`);
+          failCount++;
+          const pairName = pos.pair || "?/SOL";
+          results.push(`${pairName}: failed (${error.message}) ❌`);
         }
       }
-      await sendMessage(`Close-all finished.\n\n${results.join("\n")}`).catch(() => {});
+      
+      // Send summary
+      await sendMessage(`Close-all finished.\n\n✅ Success: ${successCount}\n❌ Failed: ${failCount}\n\n${results.join("\n")}`).catch(() => {});
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
     }

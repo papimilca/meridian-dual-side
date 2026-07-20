@@ -461,6 +461,15 @@ export function stopPolling() {
 }
 
 // ─── Notification helpers ────────────────────────────────────────
+function escapeHtml(text) {
+  if (!text) return text;
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, rangeCoverage, binStep, baseFee }) {
   if (hasActiveLiveMessage()) return;
   const priceStr = priceRange
@@ -473,7 +482,7 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
     ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
     : "";
   await sendHTML(
-    `✅ <b>Deployed</b> ${pair}\n` +
+    `✅ <b>Deployed</b> ${escapeHtml(pair)}\n` +
     `Amount: ${amountSol} SOL\n` +
     priceStr +
     coverageStr +
@@ -487,15 +496,97 @@ export async function notifyClose({ pair, pnlUsd, pnlPct }) {
   if (hasActiveLiveMessage()) return;
   const sign = pnlUsd >= 0 ? "+" : "";
   await sendHTML(
-    `🔒 <b>Closed</b> ${pair}\n` +
+    `🔒 <b>Closed</b> ${escapeHtml(pair)}\n` +
     `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
   );
+}
+
+export async function notifyCloseDetailed({
+  pair,
+  pnlUsd,
+  pnlPct,
+  feesUsd,
+  swapAmount,
+  swapSymbol,
+  netUsd,
+  netPct,
+  initialAmount,
+  finalAmount,
+  exitReason,
+  durationMinutes,
+  currency = "$",
+}) {
+  if (hasActiveLiveMessage()) return;
+  
+  const isProfit = (pnlUsd ?? 0) >= 0;
+  const statusEmoji = isProfit ? "🟢" : "🔴";
+  const checkEmoji = isProfit ? " ✅" : " ❌";
+  const sign = isProfit ? "+" : "";
+  
+  // Smart number formatting based on magnitude
+  const isSolMode = currency === "◎";
+  const fmt = (val) => {
+    if (!Number.isFinite(val)) return "?";
+    if (isSolMode) {
+      // SOL mode: always 5 decimals
+      return val.toFixed(5);
+    } else {
+      // USD mode: adaptive decimals
+      if (Math.abs(val) >= 10) {
+        return val.toFixed(2); // $10+ : 2 decimals
+      } else if (Math.abs(val) >= 0.01) {
+        return val.toFixed(4); // $0.01-$10 : 4 decimals
+      } else {
+        return val.toFixed(6); // < $0.01 : 6 decimals
+      }
+    }
+  };
+  
+  // Format duration
+  const formatDuration = (mins) => {
+    if (!Number.isFinite(mins)) return "?";
+    const hours = Math.floor(mins / 60);
+    const minutes = mins % 60;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+  };
+
+  const lines = [
+    `${statusEmoji} <b>CLOSED</b> | ${escapeHtml(pair)}`,
+    `💰 PnL : ${sign}${currency}${fmt(pnlUsd ?? 0)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)${checkEmoji}`,
+  ];
+
+  if (feesUsd != null) {
+    lines.push(`💸 Fees : +${currency}${fmt(feesUsd)}`);
+  }
+
+  if (swapAmount != null && swapSymbol) {
+    lines.push(`💵 Swap : ${escapeHtml(swapSymbol)} → ${currency}${fmt(swapAmount)}`);
+  }
+
+  if (netUsd != null && netPct != null) {
+    lines.push(`💵 Net : ${sign}${currency}${fmt(netUsd)} (${sign}${netPct.toFixed(2)}%)${checkEmoji}`);
+  }
+
+  if (initialAmount != null && finalAmount != null) {
+    lines.push(`💵 Modal : ${currency}${fmt(initialAmount)} → ${currency}${fmt(finalAmount)}`);
+  }
+
+  if (exitReason) {
+    lines.push(`📉 Exit : ${escapeHtml(exitReason)}`);
+  }
+
+  if (durationMinutes != null) {
+    lines.push(`⏱️ Duration : ${formatDuration(durationMinutes)}`);
+  }
+
+  await sendHTML(lines.join("\n"));
 }
 
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
   if (hasActiveLiveMessage()) return;
   await sendHTML(
-    `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
+    `🔄 <b>Swapped</b> ${escapeHtml(inputSymbol)} → ${escapeHtml(outputSymbol)}\n` +
     `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
     `Tx: <code>${tx?.slice(0, 16)}...</code>`
   );
@@ -504,7 +595,7 @@ export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOu
 export async function notifyOutOfRange({ pair, minutesOOR }) {
   if (hasActiveLiveMessage()) return;
   await sendHTML(
-    `⚠️ <b>Out of Range</b> ${pair}\n` +
+    `⚠️ <b>Out of Range</b> ${escapeHtml(pair)}\n` +
     `Been OOR for ${minutesOOR} minutes`
   );
 }

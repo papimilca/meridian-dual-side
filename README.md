@@ -1,4 +1,7 @@
 # Meridian
+**This is modified version of Meridian to handle imbalanced positions (Dual Side).**
+
+original version see on [https://github.com/yunus-0x/meridian.git](https://github.com/yunus-0x/meridian.git). Thanks for ```yunus0x``` for made this great agent.
 
 **Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLMs.**
 

@@ -139,6 +139,7 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    dualSide:     u.dualSide     ?? false, // Enable imbalanced/dual-side positions (amount_x_sol + amount_y)
   },
 
   // ─── Scheduling ─────────────────────────

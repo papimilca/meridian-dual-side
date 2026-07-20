@@ -27,13 +27,13 @@
     ]
   },
   "dependencies": {
-    "@meteora-ag/dlmm": "1.9.4",
+    "@meteora-ag/dlmm": "1.9.13",
     "@solana/web3.js": "^1.95.0",
     "bn.js": "^5.2.1",
     "bs58": "^5.0.0",
     "dotenv": "^17.3.1",
     "jsonrepair": "^3.13.3",
-    "node-cron": "^3.0.3",
+    "node-cron": "^4.6.0",
     "openai": "^4.73.0"
   },
   "engines": {

@@ -40,7 +40,7 @@ const TIMEFRAME_MINUTES = {
   "24h": 1440,
 };
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifyCloseDetailed, notifySwap } from "../telegram.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -680,22 +680,82 @@ export async function executeTool(name, args) {
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        // Prepare detailed notification data
+        const { getTrackedPosition } = await import("../state.js");
+        const tracked = getTrackedPosition(args.position_address);
+        const pairName = result.pool_name || tracked?.pool_name || args.position_address?.slice(0, 8);
+        
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
+        
         // Auto-swap base token back to SOL unless user said to hold (retried).
+        let swapAmount = null;
+        let swapSymbol = null;
         if (!args.skip_swap && result.base_mint) {
           const { swapped, result: swapResult } = await swapBaseToSolWithRetry(result.base_mint, "after close");
           if (swapped) {
             // Tell the model the swap already happened so it doesn't call swap_token again
             result.auto_swapped = true;
             result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
-            if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+            if (swapResult?.amount_out) {
+              result.sol_received = swapResult.amount_out;
+              swapAmount = swapResult.amount_out;
+              // Get token symbol from wallet balances if available
+              const balances = await getWalletBalances({});
+              const token = balances.tokens?.find((t) => t.mint === result.base_mint);
+              swapSymbol = token?.symbol || "token";
+            }
           }
         }
+        
+        // Calculate amounts and duration for detailed notification
+        const currency = config.management.solMode ? "◎" : "$";
+        const pnlValue = result.pnl_usd ?? 0;
+        const pnlPct = result.pnl_pct ?? 0;
+        
+        let initialAmount, finalAmount, swapAmountDisplay;
+        if (config.management.solMode) {
+          // SOL mode
+          initialAmount = tracked?.amount_sol ?? 0;
+          finalAmount = swapAmount ?? (initialAmount + pnlValue);
+          swapAmountDisplay = swapAmount;
+        } else {
+          // USD mode: use current SOL price
+          const wallet = await getWalletBalances({});
+          const solPriceUsd = wallet.sol_price ?? 0;
+          const amountSol = tracked?.amount_sol ?? 0;
+          initialAmount = amountSol * solPriceUsd;
+          finalAmount = initialAmount + pnlValue;
+          if (swapAmount) {
+            swapAmountDisplay = swapAmount * solPriceUsd;
+          } else {
+            swapAmountDisplay = null;
+          }
+        }
+        
+        const durationMinutes = tracked?.deployed_at 
+          ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
+          : null;
+        
+        // Send detailed notification
+        notifyCloseDetailed({
+          pair: pairName,
+          pnlUsd: pnlValue,
+          pnlPct: pnlPct,
+          feesUsd: tracked?.total_fees_claimed_usd ?? null,
+          swapAmount: swapAmountDisplay,
+          swapSymbol: swapSymbol,
+          netUsd: pnlValue,
+          netPct: pnlPct,
+          initialAmount: initialAmount,
+          finalAmount: finalAmount,
+          exitReason: args.reason || "Management cycle",
+          durationMinutes: durationMinutes,
+          currency: currency,
+        }).catch(() => {});
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         await swapBaseToSolWithRetry(result.base_mint, "after claim");
       }
@@ -743,16 +803,16 @@ async function runSafetyChecks(name, args) {
 
       const deployAmountY = Number(args.amount_y ?? args.amount_sol ?? 0);
       const deployAmountX = Number(args.amount_x ?? 0);
-      if (Number.isFinite(deployAmountX) && deployAmountX > 0) {
-        return {
-          pass: false,
-          reason: "This agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.",
-        };
-      }
+      const deployAmountXSol = Number(args.amount_x_sol ?? 0);
+      const totalSolUsed = deployAmountY + deployAmountXSol;
+      
+      // Imbalanced positions (amount_x_sol + amount_y) are now supported
+      const isImbalanced = deployAmountXSol > 0 && deployAmountY > 0;
+      
       const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
       const requestedBinsAbove = Number(args.bins_above ?? 0);
       const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
-      const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
+      const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0 && deployAmountXSol <= 0;
       const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
       const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
       if (args.volatility != null && (!Number.isFinite(requestedVolatility) || requestedVolatility <= 0)) {
@@ -831,38 +891,37 @@ async function runSafetyChecks(name, args) {
         }
       }
 
-      // Check amount limits
-      const amountY = deployAmountY;
-      if (!Number.isFinite(amountY) || amountY <= 0) {
+      // Check amount limits - use total SOL for imbalanced positions
+      if (totalSolUsed <= 0) {
         return {
           pass: false,
-          reason: `Must provide a positive SOL amount (amount_y).`,
+          reason: `Must provide a positive SOL amount (amount_y or amount_x_sol + amount_y).`,
         };
       }
 
       const minDeploy = Math.max(0.1, config.management.deployAmountSol);
-      if (amountY < minDeploy) {
+      if (totalSolUsed < minDeploy) {
         return {
           pass: false,
-          reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
+          reason: `Total SOL amount ${totalSolUsed} is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL total (amount_y + amount_x_sol).`,
         };
       }
-      if (amountY > config.risk.maxDeployAmount) {
+      if (totalSolUsed > config.risk.maxDeployAmount) {
         return {
           pass: false,
-          reason: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
+          reason: `Total SOL amount ${totalSolUsed} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
         };
       }
 
-      // Check SOL balance
+      // Check SOL balance - need total SOL + gas reserve
       if (process.env.DRY_RUN !== "true") {
         const balance = await getWalletBalances();
         const gasReserve = config.management.gasReserve;
-        const minRequired = amountY + gasReserve;
+        const minRequired = totalSolUsed + gasReserve;
         if (balance.sol < minRequired) {
           return {
             pass: false,
-            reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
+            reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${totalSolUsed} deploy + ${gasReserve} gas reserve).`,
           };
         }
       }

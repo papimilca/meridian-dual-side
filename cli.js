@@ -72,9 +72,14 @@ Output: { done: true, report: "..." }
 \`\`\`
 
 ### meridian deploy --pool <addr> --amount <sol> [--bins-below 69] [--bins-above 0] [--strategy bid_ask|spot] [--dry-run]
+### meridian deploy --pool <addr> --amount <sol> --amount-x-sol <sol> --bins-below <n> --bins-above <n> [--strategy spot]
 Deploys a new LP position. All safety checks apply.
+- Single-sided SOL: use --amount only (most common)
+- Imbalanced position (zap-in): use --amount (SOL) + --amount-x-sol (SOL to swap to token X first)
+  System will swap the --amount-x-sol to token X, then deploy with swapped tokens + --amount SOL
+  Total SOL used = --amount-x-sol + --amount
 \`\`\`
-Output: { success, position, pool_name, txs, price_range, bin_step }
+Output: { success, position, pool_name, txs, price_range, bin_step, total_sol_used, pre_swap }
 \`\`\`
 
 ### meridian claim --position <addr>
@@ -245,7 +250,10 @@ const { values: flags } = parseArgs({
     reason:     { type: "string" },
     "bins-below": { type: "string" },
     "bins-above": { type: "string" },
+    "downside-pct": { type: "string" },
+    "upside-pct": { type: "string" },
     "amount-x":   { type: "string" },
+    "amount-x-sol": { type: "string" },
     "amount-y":   { type: "string" },
     "bps":        { type: "string" },
     "no-claim":   { type: "boolean" },
@@ -434,17 +442,21 @@ switch (subcommand) {
   case "deploy": {
     if (!flags.pool) die("Usage: meridian deploy --pool <addr> --amount <sol>");
     const amountX = flags["amount-x"] ? parseFloat(flags["amount-x"]) : undefined;
-    if (!flags.amount && !amountX) die("--amount or --amount-x is required");
+    const amountXSol = flags["amount-x-sol"] ? parseFloat(flags["amount-x-sol"]) : undefined;
+    if (!flags.amount && !amountX && !amountXSol) die("--amount or --amount-x or --amount-x-sol is required");
 
     const { executeTool } = await import("./tools/executor.js");
     out(await executeTool("deploy_position", {
       pool_address: flags.pool,
       amount_y: flags.amount ? parseFloat(flags.amount) : undefined,
       amount_x: amountX,
+      amount_x_sol: amountXSol,
       strategy: flags.strategy,
       single_sided_x: argv.includes("--single-sided-x"),
       bins_below: flags["bins-below"] ? parseInt(flags["bins-below"]) : undefined,
       bins_above: flags["bins-above"] ? parseInt(flags["bins-above"]) : undefined,
+      downside_pct: flags["downside-pct"] ? parseFloat(flags["downside-pct"]) : undefined,
+      upside_pct: flags["upside-pct"] ? parseFloat(flags["upside-pct"]) : undefined,
       allow_duplicate_pool: argv.includes("--allow-duplicate-pool"),
     }));
     break;
