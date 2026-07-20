@@ -990,14 +990,75 @@ export async function deployPosition({
     
     // ─── Check for Partial Position Creation ───
     let partialPositionWarning = null;
+    let partialPositionClosed = false;
+    let partialPositionCloseTx = null;
+    
     try {
       const positionAccount = await getConnection().getAccountInfo(newPosition.publicKey);
       if (positionAccount) {
         log("deploy_warn", `Partial position detected: ${newPosition.publicKey.toString()} exists on-chain but deploy failed. This position may contain partial liquidity.`);
-        partialPositionWarning = {
-          position_address: newPosition.publicKey.toString(),
-          message: `Deploy failed but a partial position was created at ${newPosition.publicKey.toString()}. Check and close it manually to recover any deposited funds.`,
-        };
+        
+        // ─── Attempt to close the partial position ───
+        try {
+          log("deploy_rollback", `Attempting to close partial position: ${newPosition.publicKey.toString()}`);
+          
+          // Check if position has liquidity
+          let hasLiquidity = false;
+          let closeFromBinId = minBinId;
+          let closeToBinId = maxBinId;
+          
+          try {
+            const positionData = await pool.getPosition(newPosition.publicKey);
+            const processed = positionData?.positionData;
+            if (processed) {
+              closeFromBinId = processed.lowerBinId ?? closeFromBinId;
+              closeToBinId = processed.upperBinId ?? closeToBinId;
+              const bins = Array.isArray(processed.positionBinData) ? processed.positionBinData : [];
+              hasLiquidity = bins.some((bin) => new BN(bin.positionLiquidity || "0").gt(new BN(0)));
+            }
+          } catch (liquidityCheckError) {
+            log("deploy_rollback", `Could not check liquidity state, assuming position has liquidity: ${liquidityCheckError.message}`);
+            hasLiquidity = true; // Assume has liquidity to be safe
+          }
+          
+          const wallet = getWallet();
+          let closeTx;
+          
+          if (hasLiquidity) {
+            log("deploy_rollback", `Partial position has liquidity — removing and closing`);
+            closeTx = await pool.removeLiquidity({
+              user: wallet.publicKey,
+              position: newPosition.publicKey,
+              fromBinId: closeFromBinId,
+              toBinId: closeToBinId,
+              bps: new BN(10000),
+              shouldClaimAndClose: true,
+            });
+          } else {
+            log("deploy_rollback", `Partial position empty — closing account only`);
+            closeTx = await pool.closePosition({
+              owner: wallet.publicKey,
+              position: { publicKey: newPosition.publicKey },
+            });
+          }
+          
+          // Execute close transaction(s)
+          const closeTxs = Array.isArray(closeTx) ? closeTx : [closeTx];
+          for (const tx of closeTxs) {
+            const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+            partialPositionCloseTx = txHash;
+            log("deploy_rollback", `Partial position closed successfully: ${txHash}`);
+          }
+          
+          partialPositionClosed = true;
+          
+        } catch (closeError) {
+          log("deploy_rollback", `Failed to close partial position: ${closeError.message}`);
+          partialPositionWarning = {
+            position_address: newPosition.publicKey.toString(),
+            message: `Deploy failed and partial position at ${newPosition.publicKey.toString()} could not be closed automatically. Close it manually to recover deposited funds. Error: ${closeError.message}`,
+          };
+        }
       }
     } catch (checkError) {
       // Non-blocking: if we can't check, just continue
@@ -1028,16 +1089,29 @@ export async function deployPosition({
         const tokensDeposited = swapDetails.tokenAmount - actualBalance;
         
         if (actualBalance <= 0) {
-          log("deploy_rollback", `No tokens left in wallet to rollback (${swapDetails.tokenAmount} tokens were fully deposited in partial position)`);
+          const positionStatus = partialPositionClosed
+            ? `Partial position was closed successfully (tx: ${partialPositionCloseTx}).`
+            : partialPositionWarning
+              ? `Failed to close partial position automatically. ${partialPositionWarning.message}`
+              : `All tokens were deposited in partial position.`;
+          
+          log("deploy_rollback", `No tokens left in wallet to rollback (${swapDetails.tokenAmount} tokens were fully deposited in partial position). ${positionStatus}`);
           return {
             success: false,
             error: error.message,
-            partial_position: partialPositionWarning,
+            partial_position: partialPositionClosed ? {
+              position_address: newPosition.publicKey.toString(),
+              closed: true,
+              close_tx: partialPositionCloseTx,
+              message: `Partial position was successfully closed during rollback.`,
+            } : partialPositionWarning,
             rollback: {
               performed: false,
               reason: "no_tokens_in_wallet",
               tokens_deposited: swapDetails.tokenAmount,
-              message: `Deploy failed. All ${swapDetails.tokenAmount} swapped tokens were deposited into the partial position. Close position to recover funds.`,
+              partial_position_closed: partialPositionClosed,
+              partial_position_close_tx: partialPositionCloseTx,
+              message: `Deploy failed. All ${swapDetails.tokenAmount} swapped tokens were deposited into the partial position. ${positionStatus}`,
             },
           };
         }
@@ -1059,11 +1133,22 @@ export async function deployPosition({
           const partialDepositNote = tokensDeposited > 0 
             ? ` ${tokensDeposited.toFixed(6)} tokens were already deposited in the partial position.`
             : "";
+          const positionNote = partialPositionClosed
+            ? ` Partial position was closed (tx: ${partialPositionCloseTx}).`
+            : partialPositionWarning
+              ? ` Warning: ${partialPositionWarning.message}`
+              : "";
+          
           log("deploy_rollback", `Rollback successful: swapped ${actualBalance} tokens → ${rollbackResult.amount_out} SOL (tx: ${rollbackResult.tx})`);
           return {
             success: false,
             error: error.message,
-            partial_position: partialPositionWarning,
+            partial_position: partialPositionClosed ? {
+              position_address: newPosition.publicKey.toString(),
+              closed: true,
+              close_tx: partialPositionCloseTx,
+              message: `Partial position was successfully closed during rollback.`,
+            } : partialPositionWarning,
             rollback: {
               performed: true,
               success: true,
@@ -1072,15 +1157,28 @@ export async function deployPosition({
               sol_recovered: rollbackResult.amount_out,
               tokens_swapped_back: actualBalance,
               tokens_deposited: tokensDeposited > 0 ? tokensDeposited : null,
-              message: `Deploy failed but ${actualBalance} tokens were rolled back successfully. ${rollbackResult.amount_out} SOL recovered.${partialDepositNote}`,
+              partial_position_closed: partialPositionClosed,
+              partial_position_close_tx: partialPositionCloseTx,
+              message: `Deploy failed but ${actualBalance} tokens were rolled back successfully. ${rollbackResult.amount_out} SOL recovered.${partialDepositNote}${positionNote}`,
             },
           };
         } else {
+          const positionNote = partialPositionClosed
+            ? ` Partial position was closed (tx: ${partialPositionCloseTx}).`
+            : partialPositionWarning
+              ? ` Warning: ${partialPositionWarning.message}`
+              : "";
+          
           log("deploy_rollback", `Rollback swap failed: ${rollbackResult.error}`);
           return {
             success: false,
             error: error.message,
-            partial_position: partialPositionWarning,
+            partial_position: partialPositionClosed ? {
+              position_address: newPosition.publicKey.toString(),
+              closed: true,
+              close_tx: partialPositionCloseTx,
+              message: `Partial position was successfully closed during rollback.`,
+            } : partialPositionWarning,
             rollback: {
               performed: true,
               success: false,
@@ -1089,16 +1187,29 @@ export async function deployPosition({
               tokens_stuck: actualBalance,
               tokens_deposited: tokensDeposited > 0 ? tokensDeposited : null,
               token_mint: swapDetails.tokenMint,
-              message: `Deploy failed AND rollback swap failed. ${actualBalance} tokens of ${swapDetails.tokenMint} are stuck in wallet.${tokensDeposited > 0 ? ` ${tokensDeposited} tokens were deposited in partial position.` : ""}`,
+              partial_position_closed: partialPositionClosed,
+              partial_position_close_tx: partialPositionCloseTx,
+              message: `Deploy failed AND rollback swap failed. ${actualBalance} tokens of ${swapDetails.tokenMint} are stuck in wallet.${tokensDeposited > 0 ? ` ${tokensDeposited} tokens were deposited in partial position.` : ""}${positionNote}`,
             },
           };
         }
       } catch (rollbackError) {
+        const positionNote = partialPositionClosed
+          ? ` Partial position was closed (tx: ${partialPositionCloseTx}).`
+          : partialPositionWarning
+            ? ` Warning: ${partialPositionWarning.message}`
+            : "";
+        
         log("deploy_rollback", `Rollback attempt crashed: ${rollbackError.message}`);
         return {
           success: false,
           error: error.message,
-          partial_position: partialPositionWarning,
+          partial_position: partialPositionClosed ? {
+            position_address: newPosition.publicKey.toString(),
+            closed: true,
+            close_tx: partialPositionCloseTx,
+            message: `Partial position was successfully closed during rollback.`,
+          } : partialPositionWarning,
           rollback: {
             performed: true,
             success: false,
@@ -1106,13 +1217,28 @@ export async function deployPosition({
             original_swap_tx: swapDetails.tx,
             tokens_stuck: swapDetails.tokenAmount,
             token_mint: swapDetails.tokenMint,
-            message: `Deploy failed AND rollback crashed. ${swapDetails.tokenAmount} tokens of ${swapDetails.tokenMint} may be stuck in wallet or partial position.`,
+            partial_position_closed: partialPositionClosed,
+            partial_position_close_tx: partialPositionCloseTx,
+            message: `Deploy failed AND rollback crashed. ${swapDetails.tokenAmount} tokens of ${swapDetails.tokenMint} may be stuck in wallet or partial position.${positionNote}`,
           },
         };
       }
     }
     
-    // Return error with partial position warning if no swap rollback was needed
+    // Return error with partial position info if no swap rollback was needed
+    if (partialPositionClosed) {
+      return {
+        success: false,
+        error: error.message,
+        partial_position: {
+          position_address: newPosition.publicKey.toString(),
+          closed: true,
+          close_tx: partialPositionCloseTx,
+          message: `Deploy failed but partial position was successfully closed during rollback (tx: ${partialPositionCloseTx}).`,
+        },
+      };
+    }
+    
     if (partialPositionWarning) {
       return {
         success: false,
