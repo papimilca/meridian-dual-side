@@ -1625,32 +1625,32 @@ async function telegramHandler(msg) {
         const pairName = result.pool_name || pos.pair || tracked?.pool_name || "?/SOL";
         const pnlValue = result.pnl_usd ?? 0;
         const pnlPct = result.pnl_pct ?? 0;
+        const initialAmountSol = tracked?.amount_sol ?? 0;
+        
+        // Get current SOL price for conversions
+        const wallet = await getWalletBalances({});
+        const solPriceUsd = wallet.sol_price ?? 0;
         
         // Calculate initial and final amounts based on mode
         let initialAmount, finalAmount, swapAmountDisplay;
         if (config.management.solMode) {
-          // SOL mode: convert USD values from API to SOL
-          const wallet = await getWalletBalances({});
-          const solPriceUsd = wallet.sol_price ?? 1;
-          initialAmount = (result.initial_value_usd ?? 0) / solPriceUsd;
-          finalAmount = (result.final_value_usd ?? 0) / solPriceUsd;
+          // SOL mode: everything in SOL
+          initialAmount = initialAmountSol;
+          // If swapped, use swap amount; otherwise calculate from PnL
+          if (swapAmount != null) {
+            finalAmount = swapAmount;
+          } else {
+            // Convert USD PnL to SOL and add to initial
+            const pnlSol = solPriceUsd > 0 ? pnlValue / solPriceUsd : 0;
+            finalAmount = initialAmountSol + pnlSol;
+          }
           swapAmountDisplay = swapAmount;
         } else {
-          // USD mode: use values directly from API
-          initialAmount = result.initial_value_usd ?? 0;
-          finalAmount = result.final_value_usd ?? 0;
-          // Convert swap SOL amount to USD
-          if (swapAmount) {
-            const wallet = await getWalletBalances({});
-            const solPriceUsd = wallet.sol_price ?? 0;
-            swapAmountDisplay = swapAmount * solPriceUsd;
-          } else {
-            swapAmountDisplay = null;
-          }
+          // USD mode: everything in USD
+          initialAmount = initialAmountSol * solPriceUsd;
+          finalAmount = initialAmount + pnlValue;
+          swapAmountDisplay = swapAmount != null ? swapAmount * solPriceUsd : null;
         }
-        
-        const netValue = pnlValue;
-        const netPct = pnlPct;
         
         // Calculate duration
         const durationMinutes = tracked?.deployed_at 
@@ -1660,13 +1660,11 @@ async function telegramHandler(msg) {
         // Send detailed notification
         await notifyCloseDetailed({
           pair: pairName,
-          pnlUsd: pnlValue,
+          pnlUsd: config.management.solMode && solPriceUsd > 0 ? pnlValue / solPriceUsd : pnlValue,
           pnlPct: pnlPct,
           feesUsd: tracked?.total_fees_claimed_usd ?? null,
           swapAmount: swapAmountDisplay,
           swapSymbol: swapSymbol,
-          netUsd: netValue,
-          netPct: netPct,
           initialAmount: initialAmount,
           finalAmount: finalAmount,
           exitReason: "Manual close",
@@ -1730,32 +1728,32 @@ async function telegramHandler(msg) {
             const currency = config.management.solMode ? "◎" : "$";
             const pnlValue = result.pnl_usd ?? 0;
             const pnlPct = result.pnl_pct ?? 0;
+            const initialAmountSol = tracked?.amount_sol ?? 0;
+            
+            // Get current SOL price for conversions
+            const wallet = await getWalletBalances({});
+            const solPriceUsd = wallet.sol_price ?? 0;
             
             // Calculate initial and final amounts based on mode
             let initialAmount, finalAmount, swapAmountDisplay;
             if (config.management.solMode) {
-              // SOL mode: convert USD values from API to SOL
-              const wallet = await getWalletBalances({});
-              const solPriceUsd = wallet.sol_price ?? 1;
-              initialAmount = (result.initial_value_usd ?? 0) / solPriceUsd;
-              finalAmount = (result.final_value_usd ?? 0) / solPriceUsd;
+              // SOL mode: everything in SOL
+              initialAmount = initialAmountSol;
+              // If swapped, use swap amount; otherwise calculate from PnL
+              if (swapAmount != null) {
+                finalAmount = swapAmount;
+              } else {
+                // Convert USD PnL to SOL and add to initial
+                const pnlSol = solPriceUsd > 0 ? pnlValue / solPriceUsd : 0;
+                finalAmount = initialAmountSol + pnlSol;
+              }
               swapAmountDisplay = swapAmount;
             } else {
-              // USD mode: use values directly from API
-              initialAmount = result.initial_value_usd ?? 0;
-              finalAmount = result.final_value_usd ?? 0;
-              // Convert swap SOL amount to USD
-              if (swapAmount) {
-                const wallet = await getWalletBalances({});
-                const solPriceUsd = wallet.sol_price ?? 0;
-                swapAmountDisplay = swapAmount * solPriceUsd;
-              } else {
-                swapAmountDisplay = null;
-              }
+              // USD mode: everything in USD
+              initialAmount = initialAmountSol * solPriceUsd;
+              finalAmount = initialAmount + pnlValue;
+              swapAmountDisplay = swapAmount != null ? swapAmount * solPriceUsd : null;
             }
-            
-            const netValue = pnlValue;
-            const netPct = pnlPct;
             
             // Calculate duration
             const durationMinutes = tracked?.deployed_at 
@@ -1765,13 +1763,11 @@ async function telegramHandler(msg) {
             // Send detailed notification for this position
             await notifyCloseDetailed({
               pair: result.pool_name || pairName,
-              pnlUsd: pnlValue,
+              pnlUsd: config.management.solMode && solPriceUsd > 0 ? pnlValue / solPriceUsd : pnlValue,
               pnlPct: pnlPct,
               feesUsd: tracked?.total_fees_claimed_usd ?? null,
               swapAmount: swapAmountDisplay,
               swapSymbol: swapSymbol,
-              netUsd: netValue,
-              netPct: netPct,
               initialAmount: initialAmount,
               finalAmount: finalAmount,
               exitReason: "Manual close-all",

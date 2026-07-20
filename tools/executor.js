@@ -692,20 +692,18 @@ export async function executeTool(name, args) {
         }
         
         // Auto-swap base token back to SOL unless user said to hold (retried).
-        let swapAmount = null;
+        let swapAmountSol = null;
         let swapSymbol = null;
         if (!args.skip_swap && result.base_mint) {
-          const { swapped, result: swapResult } = await swapBaseToSolWithRetry(result.base_mint, "after close");
+          const { swapped, result: swapResult, token } = await swapBaseToSolWithRetry(result.base_mint, "after close");
           if (swapped) {
             // Tell the model the swap already happened so it doesn't call swap_token again
             result.auto_swapped = true;
             result.auto_swap_note = `Base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
             if (swapResult?.amount_out) {
               result.sol_received = swapResult.amount_out;
-              swapAmount = swapResult.amount_out;
-              // Get token symbol from wallet balances if available
-              const balances = await getWalletBalances({});
-              const token = balances.tokens?.find((t) => t.mint === result.base_mint);
+              // Convert lamports to SOL if needed
+              swapAmountSol = swapResult.amount_out > 1000 ? swapResult.amount_out / 1e9 : swapResult.amount_out;
               swapSymbol = token?.symbol || "token";
             }
           }
@@ -715,25 +713,30 @@ export async function executeTool(name, args) {
         const currency = config.management.solMode ? "◎" : "$";
         const pnlValue = result.pnl_usd ?? 0;
         const pnlPct = result.pnl_pct ?? 0;
+        const initialAmountSol = tracked?.amount_sol ?? 0;
+        
+        // Get current SOL price for conversions
+        const wallet = await getWalletBalances({});
+        const solPriceUsd = wallet.sol_price ?? 0;
         
         let initialAmount, finalAmount, swapAmountDisplay;
         if (config.management.solMode) {
-          // SOL mode
-          initialAmount = tracked?.amount_sol ?? 0;
-          finalAmount = swapAmount ?? (initialAmount + pnlValue);
-          swapAmountDisplay = swapAmount;
-        } else {
-          // USD mode: use current SOL price
-          const wallet = await getWalletBalances({});
-          const solPriceUsd = wallet.sol_price ?? 0;
-          const amountSol = tracked?.amount_sol ?? 0;
-          initialAmount = amountSol * solPriceUsd;
-          finalAmount = initialAmount + pnlValue;
-          if (swapAmount) {
-            swapAmountDisplay = swapAmount * solPriceUsd;
+          // SOL mode: everything in SOL
+          initialAmount = initialAmountSol;
+          // If swapped, use swap amount; otherwise calculate from PnL
+          if (swapAmountSol != null) {
+            finalAmount = swapAmountSol;
           } else {
-            swapAmountDisplay = null;
+            // Convert USD PnL to SOL and add to initial
+            const pnlSol = solPriceUsd > 0 ? pnlValue / solPriceUsd : 0;
+            finalAmount = initialAmountSol + pnlSol;
           }
+          swapAmountDisplay = swapAmountSol;
+        } else {
+          // USD mode: everything in USD
+          initialAmount = initialAmountSol * solPriceUsd;
+          finalAmount = initialAmount + pnlValue;
+          swapAmountDisplay = swapAmountSol != null ? swapAmountSol * solPriceUsd : null;
         }
         
         const durationMinutes = tracked?.deployed_at 
@@ -743,13 +746,11 @@ export async function executeTool(name, args) {
         // Send detailed notification
         notifyCloseDetailed({
           pair: pairName,
-          pnlUsd: pnlValue,
+          pnlUsd: config.management.solMode && solPriceUsd > 0 ? pnlValue / solPriceUsd : pnlValue,
           pnlPct: pnlPct,
           feesUsd: tracked?.total_fees_claimed_usd ?? null,
           swapAmount: swapAmountDisplay,
           swapSymbol: swapSymbol,
-          netUsd: pnlValue,
-          netPct: pnlPct,
           initialAmount: initialAmount,
           finalAmount: finalAmount,
           exitReason: args.reason || "Management cycle",

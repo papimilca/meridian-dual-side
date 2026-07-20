@@ -519,7 +519,6 @@ export async function notifyCloseDetailed({
   if (hasActiveLiveMessage()) return;
   
   const isProfit = (pnlUsd ?? 0) >= 0;
-  const statusEmoji = isProfit ? "🟢" : "🔴";
   const checkEmoji = isProfit ? " ✅" : " ❌";
   const sign = isProfit ? "+" : "";
   
@@ -552,24 +551,20 @@ export async function notifyCloseDetailed({
   };
 
   const lines = [
-    `${statusEmoji} <b>CLOSED</b> | ${escapeHtml(pair)}`,
+    `🔴 <b>CLOSED</b> | ${escapeHtml(pair)}`,
     `💰 PnL : ${sign}${currency}${fmt(pnlUsd ?? 0)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)${checkEmoji}`,
   ];
 
-  if (feesUsd != null) {
+  if (feesUsd != null && feesUsd > 0) {
     lines.push(`💸 Fees : +${currency}${fmt(feesUsd)}`);
   }
 
   if (swapAmount != null && swapSymbol) {
-    lines.push(`💵 Swap : ${escapeHtml(swapSymbol)} → ${currency}${fmt(swapAmount)}`);
-  }
-
-  if (netUsd != null && netPct != null) {
-    lines.push(`💵 Net : ${sign}${currency}${fmt(netUsd)} (${sign}${netPct.toFixed(2)}%)${checkEmoji}`);
+    lines.push(`🧮 Swap : ${escapeHtml(swapSymbol)} → ${currency}${fmt(swapAmount)}`);
   }
 
   if (initialAmount != null && finalAmount != null) {
-    lines.push(`💵 Modal : ${currency}${fmt(initialAmount)} → ${currency}${fmt(finalAmount)}`);
+    lines.push(`💵 Changes : ${currency}${fmt(initialAmount)} → ${currency}${fmt(finalAmount)}`);
   }
 
   if (exitReason) {
