@@ -680,6 +680,23 @@ export async function executeTool(name, args) {
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
+        // Get position data BEFORE closing for fallback
+        let preClosePnlUsd = 0;
+        let preClosePnlPct = 0;
+        let preCloseValueUsd = 0;
+        let preClosePos = null;
+        try {
+          const positions = await getMyPositions({ force: true, silent: true });
+          preClosePos = positions.positions?.find(p => p.position === args.position_address);
+          if (preClosePos) {
+            preClosePnlUsd = preClosePos.pnl_usd ?? 0;
+            preClosePnlPct = preClosePos.pnl_pct ?? 0;
+            preCloseValueUsd = preClosePos.total_value_usd ?? 0;
+          }
+        } catch (e) {
+          log("executor_warn", `Failed to get pre-close position data: ${e.message}`);
+        }
+        
         // Prepare detailed notification data
         const { getTrackedPosition } = await import("../state.js");
         const tracked = getTrackedPosition(args.position_address);
@@ -709,15 +726,24 @@ export async function executeTool(name, args) {
           }
         }
         
+        // Use closePosition result if available, otherwise fallback to pre-close data
+        const pnlValue = (result.pnl_usd != null && result.pnl_usd !== 0) ? result.pnl_usd : preClosePnlUsd;
+        const pnlPct = (result.pnl_pct != null && result.pnl_pct !== 0) ? result.pnl_pct : preClosePnlPct;
+        
         // Calculate amounts and duration for detailed notification
         const currency = config.management.solMode ? "◎" : "$";
-        const pnlValue = result.pnl_usd ?? 0;
-        const pnlPct = result.pnl_pct ?? 0;
-        const initialAmountSol = tracked?.amount_sol ?? 0;
         
         // Get current SOL price for conversions
         const wallet = await getWalletBalances({});
         const solPriceUsd = wallet.sol_price ?? 0;
+        
+        // Calculate initial amount: use tracked data first, fallback to calculating from total value
+        let initialAmountSol = tracked?.amount_sol ?? 0;
+        if (initialAmountSol === 0 && preCloseValueUsd > 0 && solPriceUsd > 0) {
+          // Calculate from pre-close value minus PnL
+          const preClosePnlInUsd = config.management.solMode && solPriceUsd > 0 ? preClosePnlUsd : preClosePnlUsd;
+          initialAmountSol = (preCloseValueUsd - preClosePnlInUsd) / solPriceUsd;
+        }
         
         let initialAmount, finalAmount, swapAmountDisplay;
         if (config.management.solMode) {
@@ -741,14 +767,14 @@ export async function executeTool(name, args) {
         
         const durationMinutes = tracked?.deployed_at 
           ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
-          : null;
+          : (preClosePos?.age_minutes ?? null);
         
         // Send detailed notification
         notifyCloseDetailed({
           pair: pairName,
           pnlUsd: config.management.solMode && solPriceUsd > 0 ? pnlValue / solPriceUsd : pnlValue,
           pnlPct: pnlPct,
-          feesUsd: tracked?.total_fees_claimed_usd ?? null,
+          feesUsd: tracked?.total_fees_claimed_usd ?? preClosePos?.collected_fees_usd ?? null,
           swapAmount: swapAmountDisplay,
           swapSymbol: swapSymbol,
           initialAmount: initialAmount,

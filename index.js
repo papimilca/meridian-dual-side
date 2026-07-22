@@ -1592,6 +1592,11 @@ async function telegramHandler(msg) {
       const pos = positions[idx];
       const tracked = getTrackedPosition(pos.position);
       
+      // Save position data BEFORE closing for fallback
+      const preClosePnlUsd = pos.pnl_usd ?? 0;
+      const preClosePnlPct = pos.pnl_pct ?? 0;
+      const preCloseValueUsd = pos.total_value_usd ?? 0;
+      
       await sendMessage(`Closing ${pos.pair || tracked?.pool_name || "position"}...`);
       const result = await closePosition({ position_address: pos.position, reason: "manual /close" });
       
@@ -1623,13 +1628,22 @@ async function telegramHandler(msg) {
         // Prepare detailed notification data
         const currency = config.management.solMode ? "◎" : "$";
         const pairName = result.pool_name || pos.pair || tracked?.pool_name || "?/SOL";
-        const pnlValue = result.pnl_usd ?? 0;
-        const pnlPct = result.pnl_pct ?? 0;
-        const initialAmountSol = tracked?.amount_sol ?? 0;
+        
+        // Use closePosition result if available, otherwise fallback to pre-close data
+        const pnlValue = (result.pnl_usd != null && result.pnl_usd !== 0) ? result.pnl_usd : preClosePnlUsd;
+        const pnlPct = (result.pnl_pct != null && result.pnl_pct !== 0) ? result.pnl_pct : preClosePnlPct;
         
         // Get current SOL price for conversions
         const wallet = await getWalletBalances({});
         const solPriceUsd = wallet.sol_price ?? 0;
+        
+        // Calculate initial amount: use tracked data first, fallback to calculating from total value
+        let initialAmountSol = tracked?.amount_sol ?? 0;
+        if (initialAmountSol === 0 && preCloseValueUsd > 0 && solPriceUsd > 0) {
+          // Calculate from pre-close value minus PnL
+          const preClosePnlInUsd = config.management.solMode && solPriceUsd > 0 ? preClosePnlUsd : preClosePnlUsd;
+          initialAmountSol = (preCloseValueUsd - preClosePnlInUsd) / solPriceUsd;
+        }
         
         // Calculate initial and final amounts based on mode
         let initialAmount, finalAmount, swapAmountDisplay;
@@ -1655,14 +1669,14 @@ async function telegramHandler(msg) {
         // Calculate duration
         const durationMinutes = tracked?.deployed_at 
           ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
-          : null;
+          : (pos.age_minutes ?? null);
 
         // Send detailed notification
         await notifyCloseDetailed({
           pair: pairName,
           pnlUsd: config.management.solMode && solPriceUsd > 0 ? pnlValue / solPriceUsd : pnlValue,
           pnlPct: pnlPct,
-          feesUsd: tracked?.total_fees_claimed_usd ?? null,
+          feesUsd: tracked?.total_fees_claimed_usd ?? pos.collected_fees_usd ?? null,
           swapAmount: swapAmountDisplay,
           swapSymbol: swapSymbol,
           initialAmount: initialAmount,
@@ -1695,6 +1709,11 @@ async function telegramHandler(msg) {
           const tracked = getTrackedPosition(pos.position);
           const pairName = pos.pair || tracked?.pool_name || "?/SOL";
           
+          // Save position data BEFORE closing for fallback
+          const preClosePnlUsd = pos.pnl_usd ?? 0;
+          const preClosePnlPct = pos.pnl_pct ?? 0;
+          const preCloseValueUsd = pos.total_value_usd ?? 0;
+          
           const result = await closePosition({ position_address: pos.position, reason: "manual /closeall" });
           
           if (result.success) {
@@ -1726,13 +1745,22 @@ async function telegramHandler(msg) {
 
             // Prepare detailed notification data
             const currency = config.management.solMode ? "◎" : "$";
-            const pnlValue = result.pnl_usd ?? 0;
-            const pnlPct = result.pnl_pct ?? 0;
-            const initialAmountSol = tracked?.amount_sol ?? 0;
+            
+            // Use closePosition result if available, otherwise fallback to pre-close data
+            const pnlValue = (result.pnl_usd != null && result.pnl_usd !== 0) ? result.pnl_usd : preClosePnlUsd;
+            const pnlPct = (result.pnl_pct != null && result.pnl_pct !== 0) ? result.pnl_pct : preClosePnlPct;
             
             // Get current SOL price for conversions
             const wallet = await getWalletBalances({});
             const solPriceUsd = wallet.sol_price ?? 0;
+            
+            // Calculate initial amount: use tracked data first, fallback to calculating from total value
+            let initialAmountSol = tracked?.amount_sol ?? 0;
+            if (initialAmountSol === 0 && preCloseValueUsd > 0 && solPriceUsd > 0) {
+              // Calculate from pre-close value minus PnL
+              const preClosePnlInUsd = config.management.solMode && solPriceUsd > 0 ? preClosePnlUsd : preClosePnlUsd;
+              initialAmountSol = (preCloseValueUsd - preClosePnlInUsd) / solPriceUsd;
+            }
             
             // Calculate initial and final amounts based on mode
             let initialAmount, finalAmount, swapAmountDisplay;
@@ -1758,14 +1786,14 @@ async function telegramHandler(msg) {
             // Calculate duration
             const durationMinutes = tracked?.deployed_at 
               ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
-              : null;
+              : (pos.age_minutes ?? null);
 
             // Send detailed notification for this position
             await notifyCloseDetailed({
               pair: result.pool_name || pairName,
               pnlUsd: config.management.solMode && solPriceUsd > 0 ? pnlValue / solPriceUsd : pnlValue,
               pnlPct: pnlPct,
-              feesUsd: tracked?.total_fees_claimed_usd ?? null,
+              feesUsd: tracked?.total_fees_claimed_usd ?? pos.collected_fees_usd ?? null,
               swapAmount: swapAmountDisplay,
               swapSymbol: swapSymbol,
               initialAmount: initialAmount,
