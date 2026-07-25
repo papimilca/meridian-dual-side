@@ -26,6 +26,7 @@
   "minVolume": 500,
   "minOrganic": 60,
   "minQuoteOrganic": 60,
+  "quoteTokens": ["SOL", "USDC", "USDT"],
   "minHolders": 500,
   "minMcap": 150000,
   "maxMcap": 10000000,

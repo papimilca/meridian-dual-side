@@ -124,6 +124,46 @@ function getPoolBaseMint(pool) {
     null;
 }
 
+function getPoolQuoteSymbol(pool) {
+  return pool?.token_y?.symbol ||
+    pool?.quote?.symbol ||
+    null;
+}
+
+function getPoolQuoteMint(pool) {
+  return pool?.token_y?.address ||
+    pool?.quote_token_address ||
+    pool?.quote?.mint ||
+    null;
+}
+
+function buildAllowedQuoteTokenSet(values) {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const allowed = new Set();
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    const upper = trimmed.toUpperCase();
+    allowed.add(upper);
+    allowed.add(trimmed);
+    if (config.tokens[upper]) allowed.add(config.tokens[upper]);
+  }
+  return allowed.size > 0 ? allowed : null;
+}
+
+function matchesAllowedQuoteToken(pool, values = config.screening.quoteTokens) {
+  const allowed = buildAllowedQuoteTokenSet(values);
+  if (!allowed) return true;
+  const quoteSymbol = normalizeSymbol(getPoolQuoteSymbol(pool));
+  const quoteMint = getPoolQuoteMint(pool);
+  return (quoteSymbol && allowed.has(quoteSymbol)) || (quoteMint && allowed.has(quoteMint));
+}
+
+function formatAllowedQuoteTokens(values = config.screening.quoteTokens) {
+  return Array.isArray(values) && values.length > 0 ? values.join(", ") : "any";
+}
+
 function getVolatilityTimeframe(sourceTimeframe) {
   const source = String(sourceTimeframe || "").trim();
   const sourceMinutes = TIMEFRAME_MINUTES[source];
@@ -153,6 +193,10 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (pool?.quote_token_has_critical_warnings === true) return "quote token has critical warnings";
   if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
   if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
+  if (!matchesAllowedQuoteToken(pool, s.quoteTokens)) {
+    const quoteLabel = getPoolQuoteSymbol(pool) || getPoolQuoteMint(pool) || "unknown";
+    return `quote token ${quoteLabel} not in quoteTokens [${formatAllowedQuoteTokens(s.quoteTokens)}]`;
+  }
 
   if (mcap == null || mcap < s.minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${s.minMcap}`;
   if (mcap > s.maxMcap) return `mcap ${mcap} above maxMcap ${s.maxMcap}`;

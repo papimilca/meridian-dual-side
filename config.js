@@ -63,6 +63,30 @@ function nonEmptyString(...values) {
   return null;
 }
 
+const TOKEN_MINTS = {
+  SOL:  "So11111111111111111111111111111111111111112",
+  USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+};
+
+function normalizeQuoteTokens(values) {
+  const fallback = Object.keys(TOKEN_MINTS);
+  if (!Array.isArray(values)) return fallback;
+  const normalized = [];
+  const seen = new Set();
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    const canonical = TOKEN_MINTS[trimmed.toUpperCase()] ? trimmed.toUpperCase() : trimmed;
+    const dedupeKey = canonical.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    normalized.push(canonical);
+  }
+  return normalized.length > 0 ? normalized : fallback;
+}
+
 export const config = {
   // ─── Risk Limits ─────────────────────────
   risk: {
@@ -79,6 +103,7 @@ export const config = {
     minVolume:         u.minVolume         ?? 500,
     minOrganic:        u.minOrganic        ?? 60,
     minQuoteOrganic:   u.minQuoteOrganic   ?? 60,
+    quoteTokens:       normalizeQuoteTokens(u.quoteTokens),
     minHolders:        u.minHolders        ?? 500,
     minMcap:           u.minMcap           ?? 150_000,
     maxMcap:           u.maxMcap           ?? 10_000_000,
@@ -173,9 +198,7 @@ export const config = {
 
   // ─── Common Token Mints ────────────────
   tokens: {
-    SOL:  "So11111111111111111111111111111111111111112",
-    USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    ...TOKEN_MINTS,
   },
 
   // ─── HiveMind ─────────────────────────
@@ -306,6 +329,7 @@ export function reloadScreeningThresholds() {
     if (fresh.excludeHighSupplyConcentration !== undefined) s.excludeHighSupplyConcentration = fresh.excludeHighSupplyConcentration;
     if (fresh.minOrganic     != null) s.minOrganic     = fresh.minOrganic;
     if (fresh.minQuoteOrganic != null) s.minQuoteOrganic = fresh.minQuoteOrganic;
+    if (fresh.quoteTokens !== undefined) s.quoteTokens = normalizeQuoteTokens(fresh.quoteTokens);
     if (fresh.minHolders     != null) s.minHolders     = fresh.minHolders;
     if (fresh.minMcap        != null) s.minMcap        = fresh.minMcap;
     if (fresh.maxMcap        != null) s.maxMcap        = fresh.maxMcap;

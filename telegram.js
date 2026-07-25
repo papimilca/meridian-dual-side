@@ -6,6 +6,8 @@ const USER_CONFIG_PATH = repoPath("user-config.json");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
 const BASE  = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
+const TELEGRAM_TIMEOUT_MS = 15_000;
+const TELEGRAM_MAX_ATTEMPTS = 3;
 const ALLOWED_USER_IDS = new Set(
   String(process.env.TELEGRAM_ALLOWED_USER_IDS || "")
     .split(",")
@@ -96,52 +98,141 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
-async function postTelegram(method, body) {
-  if (!TOKEN || !chatId) return null;
-  try {
-    const res = await fetch(`${BASE}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, ...body }),
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      if (res.status === 401) {
-        log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
-      } else {
-        log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
-      }
-      return null;
-    }
-    return await res.json();
-  } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
-    return null;
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isRetryableStatus(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function retryDelayMs(retryAfter, attempt) {
+  const retryAfterSec = Number(retryAfter);
+  if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
+    return Math.min(retryAfterSec * 1000, 10_000);
   }
+  return Math.min(500 * 2 ** attempt, 5_000);
+}
+
+function formatFetchError(error) {
+  const parts = [];
+  if (error?.name) parts.push(error.name);
+  if (error?.message) parts.push(error.message);
+  if (error?.cause?.code) parts.push(`cause=${error.cause.code}`);
+  else if (error?.cause?.message) parts.push(`cause=${error.cause.message}`);
+  return parts.join(": ") || "unknown fetch error";
+}
+
+function isRetryableFetchError(error) {
+  if (!error) return false;
+  if (error.name === "AbortError" || error.name === "TimeoutError") return true;
+  if (error instanceof TypeError) return true;
+  const msg = String(error.message || "").toLowerCase();
+  return (
+    msg.includes("fetch failed") ||
+    msg.includes("timeout") ||
+    msg.includes("timed out") ||
+    msg.includes("econnreset") ||
+    msg.includes("eai_again") ||
+    msg.includes("enotfound") ||
+    msg.includes("socket")
+  );
+}
+
+async function telegramFetchJson(method, body) {
+  if (!TOKEN || !chatId) return null;
+  const url = `${BASE}/${method}`;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < TELEGRAM_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, ...body }),
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        const retryAfter = res.headers.get("retry-after");
+        if (isRetryableStatus(res.status) && attempt < TELEGRAM_MAX_ATTEMPTS - 1) {
+          await sleep(retryDelayMs(retryAfter, attempt));
+          continue;
+        }
+        if (res.status === 401) {
+          log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
+        } else {
+          log("telegram_error", `${method} ${res.status}: ${errText.slice(0, 200)}`);
+        }
+        return null;
+      }
+
+      return await res.json();
+    } catch (error) {
+      lastError = error;
+      if (isRetryableFetchError(error) && attempt < TELEGRAM_MAX_ATTEMPTS - 1) {
+        await sleep(retryDelayMs(null, attempt));
+        continue;
+      }
+      break;
+    }
+  }
+
+  log("telegram_error", `${method} failed: ${formatFetchError(lastError)}`);
+  return null;
+}
+
+async function telegramFetchJsonRaw(method, body) {
+  if (!TOKEN) return null;
+  const url = `${BASE}/${method}`;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < TELEGRAM_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        const retryAfter = res.headers.get("retry-after");
+        if (isRetryableStatus(res.status) && attempt < TELEGRAM_MAX_ATTEMPTS - 1) {
+          await sleep(retryDelayMs(retryAfter, attempt));
+          continue;
+        }
+        if (res.status === 401) {
+          log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
+        } else {
+          log("telegram_error", `${method} ${res.status}: ${errText.slice(0, 200)}`);
+        }
+        return null;
+      }
+
+      return await res.json();
+    } catch (error) {
+      lastError = error;
+      if (isRetryableFetchError(error) && attempt < TELEGRAM_MAX_ATTEMPTS - 1) {
+        await sleep(retryDelayMs(null, attempt));
+        continue;
+      }
+      break;
+    }
+  }
+
+  log("telegram_error", `${method} failed: ${formatFetchError(lastError)}`);
+  return null;
+}
+
+async function postTelegram(method, body) {
+  return telegramFetchJson(method, body);
 }
 
 async function postTelegramRaw(method, body) {
-  if (!TOKEN) return null;
-  try {
-    const res = await fetch(`${BASE}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      if (res.status === 401) {
-        log("telegram_error", `${method} 401 Unauthorized — check TELEGRAM_BOT_TOKEN in .env (invalid, revoked, or encrypted without .envrypt key)`);
-      } else {
-        log("telegram_error", `${method} ${res.status}: ${err.slice(0, 200)}`);
-      }
-      return null;
-    }
-    return await res.json();
-  } catch (e) {
-    log("telegram_error", `${method} failed: ${e.message}`);
-    return null;
-  }
+  return telegramFetchJsonRaw(method, body);
 }
 
 export async function sendMessage(text) {
@@ -593,10 +684,6 @@ export async function notifyOutOfRange({ pair, minutesOOR }) {
     `⚠️ <b>Out of Range</b> ${escapeHtml(pair)}\n` +
     `Been OOR for ${minutesOOR} minutes`
   );
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 function fmtPct(value) {

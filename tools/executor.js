@@ -217,7 +217,7 @@ function normalizeConfigValue(key, value) {
     "darwinEnabled",
     "lpAgentRelayEnabled",
   ]);
-  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads"]);
+  const arrayKeys = new Set(["allowedLaunchpads", "blockedLaunchpads", "quoteTokens"]);
   const stringKeys = new Set([
     "timeframe",
     "category",
@@ -351,6 +351,7 @@ const toolMap = {
       minVolume: ["screening", "minVolume"],
       minOrganic: ["screening", "minOrganic"],
       minQuoteOrganic: ["screening", "minQuoteOrganic"],
+      quoteTokens: ["screening", "quoteTokens"],
       minHolders: ["screening", "minHolders"],
       minMcap: ["screening", "minMcap"],
       maxMcap: ["screening", "maxMcap"],
