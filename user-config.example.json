@@ -32,6 +32,7 @@
   "maxMcap": 10000000,
   "minBinStep": 80,
   "maxBinStep": 125,
+  "collectFeeMode": "both",
   "minFeeActiveTvlRatio": 0.05,
   "minTokenFeesSol": 30,
   "useDiscordSignals": false,
@@ -94,6 +95,8 @@
 
   "gmgnFeeSource": "gmgn",
   "gmgnApiKey": "",
+
+  "dualSide": true,
 
   "chartIndicators": {
     "enabled": false,

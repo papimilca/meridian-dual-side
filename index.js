@@ -1002,7 +1002,8 @@ function getDeterministicCloseRule(position, managementConfig) {
   if (
     position.fee_per_tvl_24h != null &&
     position.fee_per_tvl_24h < managementConfig.minFeePerTvl24h &&
-    (position.age_minutes ?? 0) >= 60
+    position.age_minutes != null &&
+    position.age_minutes >= (managementConfig.minAgeBeforeYieldCheck ?? 60)
   ) {
     return { action: "CLOSE", rule: 5, reason: "low yield" };
   }
@@ -1629,8 +1630,10 @@ async function telegramHandler(msg) {
         const currency = config.management.solMode ? "◎" : "$";
         const pairName = result.pool_name || pos.pair || tracked?.pool_name || "?/SOL";
         
-        // Use closePosition result if available, otherwise fallback to pre-close data
-        const pnlValue = (result.pnl_usd != null && result.pnl_usd !== 0) ? result.pnl_usd : preClosePnlUsd;
+        const resultPnlValue = config.management.solMode
+          ? (result.pnl_sol ?? result.pnl_usd)
+          : (result.pnl_true_usd ?? result.pnl_usd);
+        const pnlValue = (resultPnlValue != null && resultPnlValue !== 0) ? resultPnlValue : preClosePnlUsd;
         const pnlPct = (result.pnl_pct != null && result.pnl_pct !== 0) ? result.pnl_pct : preClosePnlPct;
         
         // Get current SOL price for conversions
@@ -1648,21 +1651,12 @@ async function telegramHandler(msg) {
         // Calculate initial and final amounts based on mode
         let initialAmount, finalAmount, swapAmountDisplay;
         if (config.management.solMode) {
-          // SOL mode: everything in SOL
-          initialAmount = initialAmountSol;
-          // If swapped, use swap amount; otherwise calculate from PnL
-          if (swapAmount != null) {
-            finalAmount = swapAmount;
-          } else {
-            // Convert USD PnL to SOL and add to initial
-            const pnlSol = solPriceUsd > 0 ? pnlValue / solPriceUsd : 0;
-            finalAmount = initialAmountSol + pnlSol;
-          }
+          initialAmount = result.initial_value_sol || initialAmountSol;
+          finalAmount = result.final_value_sol || (initialAmount + pnlValue);
           swapAmountDisplay = swapAmount;
         } else {
-          // USD mode: everything in USD
-          initialAmount = initialAmountSol * solPriceUsd;
-          finalAmount = initialAmount + pnlValue;
+          initialAmount = result.initial_value_usd || (initialAmountSol * solPriceUsd);
+          finalAmount = result.final_value_usd || (initialAmount + pnlValue);
           swapAmountDisplay = swapAmount != null ? swapAmount * solPriceUsd : null;
         }
         
@@ -1674,9 +1668,9 @@ async function telegramHandler(msg) {
         // Send detailed notification
         await notifyCloseDetailed({
           pair: pairName,
-          pnlUsd: config.management.solMode && solPriceUsd > 0 ? pnlValue / solPriceUsd : pnlValue,
+          pnlUsd: pnlValue,
           pnlPct: pnlPct,
-          feesUsd: tracked?.total_fees_claimed_usd ?? pos.collected_fees_usd ?? null,
+          feesUsd: config.management.solMode ? (result.fees_sol ?? null) : (result.fees_usd ?? tracked?.total_fees_claimed_usd ?? pos.collected_fees_usd ?? null),
           swapAmount: swapAmountDisplay,
           swapSymbol: swapSymbol,
           initialAmount: initialAmount,
@@ -1746,8 +1740,10 @@ async function telegramHandler(msg) {
             // Prepare detailed notification data
             const currency = config.management.solMode ? "◎" : "$";
             
-            // Use closePosition result if available, otherwise fallback to pre-close data
-            const pnlValue = (result.pnl_usd != null && result.pnl_usd !== 0) ? result.pnl_usd : preClosePnlUsd;
+            const resultPnlValue = config.management.solMode
+              ? (result.pnl_sol ?? result.pnl_usd)
+              : (result.pnl_true_usd ?? result.pnl_usd);
+            const pnlValue = (resultPnlValue != null && resultPnlValue !== 0) ? resultPnlValue : preClosePnlUsd;
             const pnlPct = (result.pnl_pct != null && result.pnl_pct !== 0) ? result.pnl_pct : preClosePnlPct;
             
             // Get current SOL price for conversions
@@ -1765,21 +1761,12 @@ async function telegramHandler(msg) {
             // Calculate initial and final amounts based on mode
             let initialAmount, finalAmount, swapAmountDisplay;
             if (config.management.solMode) {
-              // SOL mode: everything in SOL
-              initialAmount = initialAmountSol;
-              // If swapped, use swap amount; otherwise calculate from PnL
-              if (swapAmount != null) {
-                finalAmount = swapAmount;
-              } else {
-                // Convert USD PnL to SOL and add to initial
-                const pnlSol = solPriceUsd > 0 ? pnlValue / solPriceUsd : 0;
-                finalAmount = initialAmountSol + pnlSol;
-              }
+              initialAmount = result.initial_value_sol || initialAmountSol;
+              finalAmount = result.final_value_sol || (initialAmount + pnlValue);
               swapAmountDisplay = swapAmount;
             } else {
-              // USD mode: everything in USD
-              initialAmount = initialAmountSol * solPriceUsd;
-              finalAmount = initialAmount + pnlValue;
+              initialAmount = result.initial_value_usd || (initialAmountSol * solPriceUsd);
+              finalAmount = result.final_value_usd || (initialAmount + pnlValue);
               swapAmountDisplay = swapAmount != null ? swapAmount * solPriceUsd : null;
             }
             
@@ -1791,9 +1778,9 @@ async function telegramHandler(msg) {
             // Send detailed notification for this position
             await notifyCloseDetailed({
               pair: result.pool_name || pairName,
-              pnlUsd: config.management.solMode && solPriceUsd > 0 ? pnlValue / solPriceUsd : pnlValue,
+              pnlUsd: pnlValue,
               pnlPct: pnlPct,
-              feesUsd: tracked?.total_fees_claimed_usd ?? pos.collected_fees_usd ?? null,
+              feesUsd: config.management.solMode ? (result.fees_sol ?? null) : (result.fees_usd ?? tracked?.total_fees_claimed_usd ?? pos.collected_fees_usd ?? null),
               swapAmount: swapAmountDisplay,
               swapSymbol: swapSymbol,
               initialAmount: initialAmount,

@@ -617,19 +617,25 @@ export async function notifyCloseDetailed({
   const isSolMode = currency === "◎";
   const fmt = (val) => {
     if (!Number.isFinite(val)) return "?";
+    const absVal = Math.abs(val);
     if (isSolMode) {
-      // SOL mode: always 5 decimals
-      return val.toFixed(5);
+      return absVal.toFixed(5);
     } else {
-      // USD mode: adaptive decimals
-      if (Math.abs(val) >= 10) {
-        return val.toFixed(2); // $10+ : 2 decimals
-      } else if (Math.abs(val) >= 0.01) {
-        return val.toFixed(4); // $0.01-$10 : 4 decimals
+      if (absVal >= 10) {
+        return absVal.toFixed(2);
+      } else if (absVal >= 0.01) {
+        return absVal.toFixed(4);
       } else {
-        return val.toFixed(6); // < $0.01 : 6 decimals
+        return absVal.toFixed(6);
       }
     }
+  };
+  const money = (val, showSign = false) => {
+    const n = Number(val);
+    if (!Number.isFinite(n)) return `${currency}?`;
+    const valueSign = n >= 0 ? "+" : "-";
+    if (isSolMode) return `${currency}${showSign ? valueSign : ""}${fmt(n)}`;
+    return `${showSign ? valueSign : ""}${currency}${fmt(n)}`;
   };
   
   // Format duration
@@ -643,19 +649,19 @@ export async function notifyCloseDetailed({
 
   const lines = [
     `🔴 <b>CLOSED</b> | ${escapeHtml(pair)}`,
-    `💰 PnL : ${sign}${currency}${fmt(pnlUsd ?? 0)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)${checkEmoji}`,
+    `💰 PnL : ${money(pnlUsd ?? 0, true)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)${checkEmoji}`,
   ];
 
   if (feesUsd != null && feesUsd > 0) {
-    lines.push(`💸 Fees : +${currency}${fmt(feesUsd)}`);
+    lines.push(`💸 Fees : ${money(feesUsd, true)}`);
   }
 
   if (swapAmount != null && swapSymbol) {
-    lines.push(`🧮 Swap : ${escapeHtml(swapSymbol)} → ${currency}${fmt(swapAmount)}`);
+    lines.push(`🧮 Swap : ${escapeHtml(swapSymbol)} → ${money(swapAmount)}`);
   }
 
   if (initialAmount != null && finalAmount != null) {
-    lines.push(`💵 Changes : ${currency}${fmt(initialAmount)} → ${currency}${fmt(finalAmount)}`);
+    lines.push(`💵 Changes : ${money(initialAmount)} → ${money(finalAmount)}`);
   }
 
   if (exitReason) {

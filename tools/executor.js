@@ -70,6 +70,20 @@ function poolDetailVolatility(pool) {
   return numberOrNull(pool?.volatility);
 }
 
+function poolDetailCollectFeeMode(pool) {
+  const raw = pool?.dlmm_params?.collect_fee_mode ??
+    pool?.pool_config?.collect_fee_mode ??
+    pool?.collect_fee_mode ??
+    null;
+  if (raw == null) return null;
+  if (raw === 0) return "both";
+  if (raw === 1) return "quote";
+  const normalized = String(raw).trim().toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  if (["both", "quote_base", "base_quote", "quote_and_base", "base_and_quote"].includes(normalized)) return "both";
+  if (["quote", "quote_only"].includes(normalized)) return "quote";
+  return normalized || null;
+}
+
 async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.timeframe || "5m") {
   const encodedTimeframe = encodeURIComponent(timeframe);
   const filter = encodeURIComponent(`pool_address=${poolAddress}`);
@@ -89,6 +103,14 @@ async function validateDeployPoolThresholds(args) {
     return {
       pass: false,
       reason: `Could not verify pool screening thresholds before deploy: ${error.message}`,
+    };
+  }
+
+  const collectFeeMode = poolDetailCollectFeeMode(detail);
+  if (collectFeeMode !== "both") {
+    return {
+      pass: false,
+      reason: `Pool fee collection token ${collectFeeMode ?? "unknown"} is not quote+base. Refusing deploy.`,
     };
   }
 
@@ -727,8 +749,10 @@ export async function executeTool(name, args) {
           }
         }
         
-        // Use closePosition result if available, otherwise fallback to pre-close data
-        const pnlValue = (result.pnl_usd != null && result.pnl_usd !== 0) ? result.pnl_usd : preClosePnlUsd;
+        const resultPnlValue = config.management.solMode
+          ? (result.pnl_sol ?? result.pnl_usd)
+          : (result.pnl_true_usd ?? result.pnl_usd);
+        const pnlValue = (resultPnlValue != null && resultPnlValue !== 0) ? resultPnlValue : preClosePnlUsd;
         const pnlPct = (result.pnl_pct != null && result.pnl_pct !== 0) ? result.pnl_pct : preClosePnlPct;
         
         // Calculate amounts and duration for detailed notification
@@ -748,21 +772,12 @@ export async function executeTool(name, args) {
         
         let initialAmount, finalAmount, swapAmountDisplay;
         if (config.management.solMode) {
-          // SOL mode: everything in SOL
-          initialAmount = initialAmountSol;
-          // If swapped, use swap amount; otherwise calculate from PnL
-          if (swapAmountSol != null) {
-            finalAmount = swapAmountSol;
-          } else {
-            // Convert USD PnL to SOL and add to initial
-            const pnlSol = solPriceUsd > 0 ? pnlValue / solPriceUsd : 0;
-            finalAmount = initialAmountSol + pnlSol;
-          }
+          initialAmount = result.initial_value_sol || initialAmountSol;
+          finalAmount = result.final_value_sol || (initialAmount + pnlValue);
           swapAmountDisplay = swapAmountSol;
         } else {
-          // USD mode: everything in USD
-          initialAmount = initialAmountSol * solPriceUsd;
-          finalAmount = initialAmount + pnlValue;
+          initialAmount = result.initial_value_usd || (initialAmountSol * solPriceUsd);
+          finalAmount = result.final_value_usd || (initialAmount + pnlValue);
           swapAmountDisplay = swapAmountSol != null ? swapAmountSol * solPriceUsd : null;
         }
         
@@ -773,9 +788,9 @@ export async function executeTool(name, args) {
         // Send detailed notification
         notifyCloseDetailed({
           pair: pairName,
-          pnlUsd: config.management.solMode && solPriceUsd > 0 ? pnlValue / solPriceUsd : pnlValue,
+          pnlUsd: pnlValue,
           pnlPct: pnlPct,
-          feesUsd: tracked?.total_fees_claimed_usd ?? preClosePos?.collected_fees_usd ?? null,
+          feesUsd: config.management.solMode ? (result.fees_sol ?? null) : (result.fees_usd ?? tracked?.total_fees_claimed_usd ?? preClosePos?.collected_fees_usd ?? null),
           swapAmount: swapAmountDisplay,
           swapSymbol: swapSymbol,
           initialAmount: initialAmount,

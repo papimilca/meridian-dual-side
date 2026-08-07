@@ -100,6 +100,20 @@ function isUsableVolatility(value) {
   return Number.isFinite(n) && n > 0;
 }
 
+function getCollectFeeMode(pool) {
+  const raw = pool?.dlmm_params?.collect_fee_mode ??
+    pool?.pool_config?.collect_fee_mode ??
+    pool?.collect_fee_mode ??
+    null;
+  if (raw == null) return null;
+  if (raw === 0) return "both";
+  if (raw === 1) return "quote";
+  const normalized = String(raw).trim().toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  if (["both", "quote_base", "base_quote", "quote_and_base", "base_and_quote"].includes(normalized)) return "both";
+  if (["quote", "quote_only"].includes(normalized)) return "quote";
+  return normalized || null;
+}
+
 function includesCaseInsensitive(values, value) {
   if (!Array.isArray(values) || values.length === 0 || !value) return false;
   const needle = String(value).toLowerCase();
@@ -175,6 +189,7 @@ function getRawPoolScreeningRejectReason(pool, s) {
   const base = pool?.token_x || {};
   const quote = pool?.token_y || {};
   const binStep = numeric(pool?.dlmm_params?.bin_step);
+  const collectFeeMode = getCollectFeeMode(pool);
   const tvl = numeric(pool?.tvl ?? pool?.active_tvl);
   const feeActiveTvlRatio = numeric(pool?.fee_active_tvl_ratio);
   const volatility = numeric(pool?.volatility);
@@ -193,6 +208,7 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (pool?.quote_token_has_critical_warnings === true) return "quote token has critical warnings";
   if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
   if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
+  if (collectFeeMode !== "both") return `fee collection token ${collectFeeMode ?? "unknown"} is not quote+base`;
   if (!matchesAllowedQuoteToken(pool, s.quoteTokens)) {
     const quoteLabel = getPoolQuoteSymbol(pool) || getPoolQuoteMint(pool) || "unknown";
     return `quote token ${quoteLabel} not in quoteTokens [${formatAllowedQuoteTokens(s.quoteTokens)}]`;
@@ -803,6 +819,7 @@ function condensePool(p) {
     },
     pool_type: p.pool_type,
     bin_step: p.dlmm_params?.bin_step || null,
+    collect_fee_mode: getCollectFeeMode(p),
     fee_pct: p.fee_pct,
 
     // Core metrics (the numbers that matter)

@@ -109,6 +109,7 @@ export const config = {
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
+    collectFeeMode:    "both",
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
@@ -321,6 +322,7 @@ export function reloadScreeningThresholds() {
     if (!fs.existsSync(USER_CONFIG_PATH)) return;
     const fresh = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
     const s = config.screening;
+    const m = config.management;
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
     if (fresh.minTokenFeesSol  != null) s.minTokenFeesSol  = fresh.minTokenFeesSol;
     if (fresh.maxTop10Pct      != null) s.maxTop10Pct      = fresh.maxTop10Pct;
@@ -347,6 +349,36 @@ export function reloadScreeningThresholds() {
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
     if (fresh.allowedLaunchpads !== undefined) s.allowedLaunchpads = fresh.allowedLaunchpads;
     if (fresh.blockedLaunchpads !== undefined) s.blockedLaunchpads = fresh.blockedLaunchpads;
+    if (fresh.minClaimAmount        != null) m.minClaimAmount        = fresh.minClaimAmount;
+    if (fresh.autoSwapAfterClaim    !== undefined) m.autoSwapAfterClaim    = fresh.autoSwapAfterClaim;
+    if (fresh.autoSwapRetryAttempts != null) m.autoSwapRetryAttempts = fresh.autoSwapRetryAttempts;
+    if (fresh.autoSwapRetryDelayMs  != null) m.autoSwapRetryDelayMs  = fresh.autoSwapRetryDelayMs;
+    if (fresh.outOfRangeBinsToClose != null) m.outOfRangeBinsToClose = fresh.outOfRangeBinsToClose;
+    if (fresh.outOfRangeWaitMinutes != null) m.outOfRangeWaitMinutes = fresh.outOfRangeWaitMinutes;
+    if (fresh.oorCooldownTriggerCount != null) m.oorCooldownTriggerCount = fresh.oorCooldownTriggerCount;
+    if (fresh.oorCooldownHours       != null) m.oorCooldownHours       = fresh.oorCooldownHours;
+    if (fresh.repeatDeployCooldownEnabled !== undefined) m.repeatDeployCooldownEnabled = fresh.repeatDeployCooldownEnabled;
+    if (fresh.repeatDeployCooldownTriggerCount != null) m.repeatDeployCooldownTriggerCount = fresh.repeatDeployCooldownTriggerCount;
+    if (fresh.repeatDeployCooldownHours != null) m.repeatDeployCooldownHours = fresh.repeatDeployCooldownHours;
+    if (fresh.repeatDeployCooldownScope != null) m.repeatDeployCooldownScope = fresh.repeatDeployCooldownScope;
+    if (fresh.repeatDeployCooldownMinFeeEarnedPct != null) m.repeatDeployCooldownMinFeeEarnedPct = fresh.repeatDeployCooldownMinFeeEarnedPct;
+    if (fresh.repeatDeployCooldownMinFeeYieldPct != null) m.repeatDeployCooldownMinFeeEarnedPct = fresh.repeatDeployCooldownMinFeeYieldPct;
+    if (fresh.minVolumeToRebalance  != null) m.minVolumeToRebalance  = fresh.minVolumeToRebalance;
+    if (fresh.stopLossPct           != null) m.stopLossPct           = fresh.stopLossPct;
+    if (fresh.emergencyPriceDropPct != null) m.stopLossPct           = fresh.emergencyPriceDropPct;
+    if (fresh.takeProfitPct         != null) m.takeProfitPct         = fresh.takeProfitPct;
+    if (fresh.takeProfitFeePct      != null) m.takeProfitPct         = fresh.takeProfitFeePct;
+    if (fresh.minFeePerTvl24h       != null) m.minFeePerTvl24h       = fresh.minFeePerTvl24h;
+    if (fresh.minAgeBeforeYieldCheck != null) m.minAgeBeforeYieldCheck = fresh.minAgeBeforeYieldCheck;
+    if (fresh.minSolToOpen          != null) m.minSolToOpen          = fresh.minSolToOpen;
+    if (fresh.deployAmountSol       != null) m.deployAmountSol       = fresh.deployAmountSol;
+    if (fresh.gasReserve            != null) m.gasReserve            = fresh.gasReserve;
+    if (fresh.positionSizePct       != null) m.positionSizePct       = fresh.positionSizePct;
+    if (fresh.trailingTakeProfit    !== undefined) m.trailingTakeProfit    = fresh.trailingTakeProfit;
+    if (fresh.trailingTriggerPct    != null) m.trailingTriggerPct    = fresh.trailingTriggerPct;
+    if (fresh.trailingDropPct       != null) m.trailingDropPct       = fresh.trailingDropPct;
+    if (fresh.pnlSanityMaxDiffPct   != null) m.pnlSanityMaxDiffPct   = fresh.pnlSanityMaxDiffPct;
+    if (fresh.solMode               !== undefined) m.solMode               = fresh.solMode;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;
