@@ -85,7 +85,7 @@ Autonomous DLMM liquidity provider agent for Meteora pools on Solana.
 | `cli.js` | 676 | One-shot CLI; every tool exposed as a subcommand. Also writes a `~/.meridian/SKILL.md` at startup for agent discovery. Loads `.env`/`user-config.json` from `~/.meridian/` if present, else from cwd. |
 | `setup.js` | ~750 | Interactive first-run wizard. Three presets (degen/moderate/safe) + custom. Covers strategy, screening filters, position sizing, trailing TP, per-role models. |
 | **Config & state** | | |
-| `config.js` | 278 | Loads `user-config.json` → live `config` object. Sections: `risk`, `screening`, `management`, `strategy`, `schedule`, `llm`, `darwin`, `tokens`, `hiveMind`, `api`, `jupiter`, `indicators`. Exposes `computeDeployAmount(walletSol)`, `reloadScreeningThresholds()`. `MIN_SAFE_BINS_BELOW = 35` (exported). |
+| `config.js` | 278 | Loads `user-config.json` → live `config` object. Sections: `risk`, `screening`, `management`, `strategy`, `schedule`, `llm`, `darwin`, `tokens`, `hiveMind`, `api`, `jupiter`, `indicators`. Exposes `computeDeployAmount(walletSol)`, `reloadScreeningThresholds()`. `MIN_SAFE_BINS_BELOW = 35` (default when unset, exported) + `ABS_MIN_BINS_BELOW = 2` (hard floor, exported). |
 | `prompt.js` | 176 | `buildSystemPrompt(agentType, …)`. Three role-specific prompts. MANAGER is intentionally lean (positions pre-loaded into goal). SCREENER gets bins_below formula. |
 | **Tools layer** | | |
 | `tools/definitions.js` | 1124 | OpenAI-format tool schemas. **Source of truth for what the LLM sees.** All 40+ tool names listed. |
@@ -223,7 +223,7 @@ deployPosition()                   tools/dlmm.js
    ├─ safety: pool_detail fresh fetch, TVL, fee/TVL, volatility, bin_step
    ├─ safety: bin-array init rent check (refuses pools that need initialization)
    ├─ strategy: spot | curve | bid_ask (config.strategy.strategy)
-   ├─ range: bins_below linear in volatility, totalBins >= 35 (MIN_SAFE_BINS_BELOW)
+   ├─ range: bins_below linear in volatility, totalBins >= minBinsBelow (default 35, hard floor ABS_MIN_BINS_BELOW=2)
    ├─ wide path: totalBins > 69 → createExtendedEmptyPosition + addLiquidityByStrategyChunkable
    ├─ standard path: initializePositionAndAddLiquidityByStrategy
    └─ post: trackPosition({ signal_snapshot: getAndClearStagedSignals })
@@ -303,9 +303,9 @@ All persistent files are loaded/saved on each call — no in-memory caching laye
 | `jupiter` | `apiKey`, `referralAccount`, `referralFeeBps` | env override, fixed referral, 50 bps |
 | `indicators` | `enabled`, `entryPreset`, `exitPreset`, `rsiLength`, `intervals`, `candles`, `rsiOversold`, `rsiOverbought`, `requireAllIntervals` | false, supertrend_break, supertrend_break, 2, ["5_MINUTE"], 298, 30, 80, false |
 
-`update_config` (executor.js:333) uses a flat-key `CONFIG_MAP` (50+ entries) that knows how to (a) coerce booleans/arrays/strings/numbers, (b) clamp `binsBelow*` to `MIN_SAFE_BINS_BELOW=35`, (c) restart cron if `managementIntervalMin` / `screeningIntervalMin` changed, (d) write a `[SELF-TUNED]` lesson.
+`update_config` (executor.js:333) uses a flat-key `CONFIG_MAP` (50+ entries) that knows how to (a) coerce booleans/arrays/strings/numbers, (b) clamp `binsBelow*` to `ABS_MIN_BINS_BELOW=2` (default `MIN_SAFE_BINS_BELOW=35` when unset), (c) restart cron if `managementIntervalMin` / `screeningIntervalMin` changed, (d) write a `[SELF-TUNED]` lesson.
 
-`computeDeployAmount(walletSol) = clamp((walletSol - gasReserve) × positionSizePct, [deployAmountSol, maxDeployAmount])` → 2-decimal SOL.
+`computeDeployAmount(walletSol)`: **fixed mode** (default) — `deployAmountSol` explicitly set in user-config/update_config → deploy exactly that amount (capped by `maxDeployAmount`); **pct mode** — `deployAmountSol` unset → `clamp((walletSol - gasReserve) × positionSizePct, [0.5, maxDeployAmount])` → 2-decimal SOL.
 
 `reloadScreeningThresholds()` (config.js:236) is called by `evolveThresholds` to re-apply changes to the in-memory `config` without process restart.
 

@@ -303,7 +303,7 @@ const dryRun = await askBool(
 const minBinsBelow = await askNum(
   "Minimum bins below active bin",
   p("minBinsBelow", e("minBinsBelow", 35)),
-  { min: 35, max: 1400 }
+  { min: 2, max: 1400 }
 );
 
 const maxBinsBelow = await askNum(

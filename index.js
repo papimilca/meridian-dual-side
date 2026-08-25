@@ -8,7 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances, swapToken } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, ABS_MIN_BINS_BELOW } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -1306,7 +1306,7 @@ async function applySettingsMenuCallback(msg) {
     if (key === "repeatDeployCooldownTriggerCount") value = Math.max(1, Math.round(value));
     if (key === "repeatDeployCooldownHours") value = Math.max(0, Math.round(value));
     if (key === "repeatDeployCooldownMinFeeEarnedPct") value = Math.max(0, value);
-    if (["minBinsBelow", "maxBinsBelow", "defaultBinsBelow"].includes(key)) value = Math.max(35, Math.round(value));
+    if (["minBinsBelow", "maxBinsBelow", "defaultBinsBelow"].includes(key)) value = Math.max(ABS_MIN_BINS_BELOW, Math.round(value));
     if (["deployAmountSol", "gasReserve", "maxDeployAmount"].includes(key)) value = Math.max(0, value);
   } else if (action === "set") {
     value = normalizeMenuValue(key, parts.slice(3).join(":"));

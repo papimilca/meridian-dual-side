@@ -496,8 +496,8 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 
 | Field | Default | Description |
 |---|---|---|
-| `deployAmountSol` | `0.5` | Base SOL per new position |
-| `positionSizePct` | `0.35` | Fraction of deployable balance to use |
+| `deployAmountSol` | `0.5` | Fixed SOL per new position (used as-is when set; position sizing falls back to `positionSizePct` scaling only when unset) |
+| `positionSizePct` | `0.35` | Fraction of deployable balance to use (only when `deployAmountSol` is unset) |
 | `maxDeployAmount` | `50` | Maximum SOL cap per position |
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |

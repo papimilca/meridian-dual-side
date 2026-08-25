@@ -13,7 +13,10 @@ const DEFAULT_HIVEMIND_API_KEY = DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY;
 const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
   : {};
+// Default min bins below when user-config.json doesn't set one.
 export const MIN_SAFE_BINS_BELOW = 35;
+// Absolute hard floor for user-configured min/max/defaultBinsBelow (blocks 0/negative/1-bin ranges).
+export const ABS_MIN_BINS_BELOW = 2;
 
 function numericConfig(value) {
   const n = Number(value);
@@ -25,7 +28,7 @@ const configuredMinBinsBelow = numericConfig(u.minBinsBelow) ?? MIN_SAFE_BINS_BE
 const configuredMaxBinsBelow = numericConfig(u.maxBinsBelow)
   ?? (legacyBinsBelow != null ? Math.max(legacyBinsBelow, configuredMinBinsBelow) : 69);
 const configuredDefaultBinsBelow = numericConfig(u.defaultBinsBelow) ?? legacyBinsBelow ?? configuredMaxBinsBelow;
-const strategyMinBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Math.round(configuredMinBinsBelow));
+const strategyMinBinsBelow = Math.max(ABS_MIN_BINS_BELOW, Math.round(configuredMinBinsBelow));
 const strategyMaxBinsBelow = Math.max(strategyMinBinsBelow, Math.round(configuredMaxBinsBelow));
 const strategyDefaultBinsBelow = Math.max(
   strategyMinBinsBelow,
@@ -148,6 +151,8 @@ export const config = {
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
+    // true when deployAmountSol was explicitly set (user-config or update_config) → deploy exactly that amount
+    deployAmountSolExplicit: numericConfig(u.deployAmountSol) != null,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
     // Trailing take-profit
@@ -290,13 +295,16 @@ export const config = {
 };
 
 /**
- * Compute the optimal deploy amount for a given wallet balance.
- * Scales position size with wallet growth (compounding).
+ * Compute the deploy amount for a given wallet balance.
  *
- * Formula: clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)
+ * Fixed mode (deployAmountSol explicitly set in user-config or via update_config):
+ *   deploy exactly deployAmountSol, capped by maxDeployAmount.
  *
- * Examples (defaults: gasReserve=0.2, positionSizePct=0.35, floor=0.5):
- *   0.8 SOL wallet → 0.6 SOL deploy  (floor)
+ * Pct mode (deployAmountSol unset) — scales position size with wallet growth (compounding):
+ *   clamp(deployable × positionSizePct, floor=deployAmountSol default 0.5, ceil=maxDeployAmount)
+ *
+ * Pct-mode examples (defaults: gasReserve=0.2, positionSizePct=0.35, floor=0.5):
+ *   0.8 SOL wallet → 0.5 SOL deploy  (floor)
  *   2.0 SOL wallet → 0.63 SOL deploy
  *   3.0 SOL wallet → 0.98 SOL deploy
  *   4.0 SOL wallet → 1.33 SOL deploy
@@ -304,8 +312,11 @@ export const config = {
 export function computeDeployAmount(walletSol) {
   const reserve  = config.management.gasReserve      ?? 0.2;
   const pct      = config.management.positionSizePct ?? 0.35;
-  const floor    = config.management.deployAmountSol;
+  const floor    = config.management.deployAmountSol ?? 0.5;
   const ceil     = config.risk.maxDeployAmount;
+  if (config.management.deployAmountSolExplicit) {
+    return parseFloat(Math.min(ceil, Math.max(0, floor)).toFixed(2));
+  }
   const deployable = Math.max(0, walletSol - reserve);
   const dynamic    = deployable * pct;
   const result     = Math.min(ceil, Math.max(floor, dynamic));
@@ -372,6 +383,7 @@ export function reloadScreeningThresholds() {
     if (fresh.minAgeBeforeYieldCheck != null) m.minAgeBeforeYieldCheck = fresh.minAgeBeforeYieldCheck;
     if (fresh.minSolToOpen          != null) m.minSolToOpen          = fresh.minSolToOpen;
     if (fresh.deployAmountSol       != null) m.deployAmountSol       = fresh.deployAmountSol;
+    m.deployAmountSolExplicit = numericConfig(fresh.deployAmountSol) != null;
     if (fresh.gasReserve            != null) m.gasReserve            = fresh.gasReserve;
     if (fresh.positionSizePct       != null) m.positionSizePct       = fresh.positionSizePct;
     if (fresh.trailingTakeProfit    !== undefined) m.trailingTakeProfit    = fresh.trailingTakeProfit;
@@ -382,7 +394,7 @@ export function reloadScreeningThresholds() {
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
     const maxBinsBelow = numericConfig(fresh.maxBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.maxBinsBelow;
     const defaultBinsBelow = numericConfig(fresh.defaultBinsBelow) ?? numericConfig(fresh.binsBelow) ?? config.strategy.defaultBinsBelow ?? maxBinsBelow;
-    config.strategy.minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Math.round(minBinsBelow));
+    config.strategy.minBinsBelow = Math.max(ABS_MIN_BINS_BELOW, Math.round(minBinsBelow));
     config.strategy.maxBinsBelow = Math.max(config.strategy.minBinsBelow, Math.round(maxBinsBelow));
     config.strategy.defaultBinsBelow = Math.max(
       config.strategy.minBinsBelow,
