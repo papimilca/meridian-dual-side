@@ -96,10 +96,13 @@ let _screeningLastTriggered = 0; // epoch ms — prevents management from spammi
 // Exit/peak confirmation is now done by consecutive-tick counting in state.js
 // (registerExitSignal / confirmPeak), driven by the 3s RPC poller — no setTimeout rechecks.
 
-/** Strip <think>...</think> reasoning blocks that some models leak into output */
+/** Strip <think>/<thinking> reasoning blocks that some models leak into output */
 function stripThink(text) {
   if (!text) return text;
-  return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  return text
+    .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "")
+    .replace(/<think(?:ing)?>[\s\S]*$/i, "") // unclosed block
+    .trim();
 }
 
 function sanitizeUntrustedPromptText(text, maxLen = 500) {

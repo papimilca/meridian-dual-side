@@ -256,6 +256,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         throw new Error(`API returned no choices: ${response.error?.message || JSON.stringify(response)}`);
       }
       const msg = response.choices[0].message;
+      // Some models leak reasoning blocks into content — strip them at the source
+      if (typeof msg.content === "string" && /<think(?:ing)?>/i.test(msg.content)) {
+        msg.content = msg.content
+          .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "")
+          .replace(/<think(?:ing)?>[\s\S]*$/i, "") // unclosed block
+          .trim();
+      }
       const invalidToolArgErrors = new Map();
       // Keep tool-call history API-valid, but never execute unrecoverable args.
       if (msg.tool_calls) {
