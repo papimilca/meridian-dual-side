@@ -112,7 +112,7 @@ export const config = {
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
-    collectFeeMode:    "both",
+    collectFeeMode:    u.collectFeeMode ?? "both", // both | quote | base | any (any = disable fee-mode filter)
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam

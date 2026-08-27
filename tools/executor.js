@@ -107,7 +107,7 @@ async function validateDeployPoolThresholds(args) {
   }
 
   const collectFeeMode = poolDetailCollectFeeMode(detail);
-  if (collectFeeMode !== "both") {
+  if (config.screening.collectFeeMode !== "any" && collectFeeMode !== "both") {
     return {
       pass: false,
       reason: `Pool fee collection token ${collectFeeMode ?? "unknown"} is not quote+base. Refusing deploy.`,

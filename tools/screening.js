@@ -208,7 +208,7 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (pool?.quote_token_has_critical_warnings === true) return "quote token has critical warnings";
   if (pool?.base_token_has_high_single_ownership === true) return "base token has high single ownership";
   if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
-  if (collectFeeMode !== "both") return `fee collection token ${collectFeeMode ?? "unknown"} is not quote+base`;
+  if (s.collectFeeMode !== "any" && collectFeeMode !== "both") return `fee collection token ${collectFeeMode ?? "unknown"} is not quote+base`;
   if (!matchesAllowedQuoteToken(pool, s.quoteTokens)) {
     const quoteLabel = getPoolQuoteSymbol(pool) || getPoolQuoteMint(pool) || "unknown";
     return `quote token ${quoteLabel} not in quoteTokens [${formatAllowedQuoteTokens(s.quoteTokens)}]`;
