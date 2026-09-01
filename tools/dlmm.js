@@ -1893,6 +1893,21 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
   const tokenYMint = pool.lbPair.tokenYMint;        // quote token (SOL/USDC/USDT)
   const SOL_MINT = new PublicKey(config.tokens.SOL);
 
+  // ── Capture pre-close PnL snapshot from livePosition ─────────
+  // livePosition was fetched BEFORE any close txs, so it has valid PnL.
+  // Used as fallback if closed PnL API hasn't settled yet.
+  const solMode = config.management.solMode;
+  const preClosePnlUsd      = livePosition?.pnl_usd ?? 0;
+  const preClosePnlTrueUsd  = livePosition?.pnl_true_usd ?? (solMode ? 0 : preClosePnlUsd);
+  const preClosePnlSol      = livePosition?.pnl_usd ?? 0;  // in solMode, pnl_usd IS pnl sol
+  const preClosePnlPct      = livePosition?.pnl_pct ?? 0;
+  const preCloseTotalValue  = livePosition?.total_value_usd ?? 0;
+  const preCloseTrueValue   = livePosition?.total_value_true_usd ?? preCloseTotalValue;
+  const preCloseFeesUsd     = (livePosition?.collected_fees_true_usd ?? 0) + (livePosition?.unclaimed_fees_true_usd ?? 0);
+  const preCloseFeesSol     = (livePosition?.collected_fees_usd ?? 0) + (livePosition?.unclaimed_fees_usd ?? 0);
+  const initialUsdTracked   = tracked?.initial_value_usd ?? 0;
+  const initialSolTracked   = tracked?.amount_sol ?? 0;
+
   // ── Determine position bin range ──────────────────────────────
   const closeFromBinId = livePosition?.lower_bin ?? tracked?.bin_range?.min ?? -887272;
   const closeToBinId   = livePosition?.upper_bin ?? tracked?.bin_range?.max ?? 887272;
@@ -1998,6 +2013,45 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
       percentageToZapOut: 100,
     });
 
+    // ── Add Jupiter compute budget + setup instructions ──────────
+    // The zap-sdk only uses swapInstruction from the Jupiter response, but
+    // computeBudgetInstructions (priority fee + compute unit limit) and
+    // setupInstructions (ATA creation, etc.) are needed for the swap to
+    // execute properly.  Without them the swap can fail silently or use
+    // default compute budget (200k units) which is often insufficient.
+    const jupiterExtraIxs = [];
+    if (Array.isArray(swapInstructionResponse?.computeBudgetInstructions)) {
+      for (const ix of swapInstructionResponse.computeBudgetInstructions) {
+        jupiterExtraIxs.push(new TransactionInstruction({
+          programId: new PublicKey(ix.programId),
+          keys: (ix.accounts || []).map(a => ({
+            pubkey: new PublicKey(a.pubkey),
+            isSigner: a.isSigner,
+            isWritable: a.isWritable,
+          })),
+          data: Buffer.from(ix.data, "base64"),
+        }));
+      }
+    }
+    if (Array.isArray(swapInstructionResponse?.setupInstructions)) {
+      for (const ix of swapInstructionResponse.setupInstructions) {
+        jupiterExtraIxs.push(new TransactionInstruction({
+          programId: new PublicKey(ix.programId),
+          keys: (ix.accounts || []).map(a => ({
+            pubkey: new PublicKey(a.pubkey),
+            isSigner: a.isSigner,
+            isWritable: a.isWritable,
+          })),
+          data: Buffer.from(ix.data, "base64"),
+        }));
+      }
+    }
+    // Prepend compute budget + setup instructions BEFORE the zap-out instructions
+    if (jupiterExtraIxs.length > 0) {
+      zapOutTx.instructions.unshift(...jupiterExtraIxs);
+      log("close", `Zap-out: added ${jupiterExtraIxs.length} Jupiter compute/setup instruction(s) to zap-out tx`);
+    }
+
     // Sign and send the zap-out tx
     const { blockhash } = await connection.getLatestBlockhash();
     zapOutTx.recentBlockhash = blockhash;
@@ -2054,10 +2108,54 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
 
   recordClose(position_address, reason || "agent decision");
 
-  // ── PnL fetch — fire and forget (non-blocking) ───────────────
-  // Don't block the return on PnL settling; fetch in background.
-  fetchClosedPnL({ position_address, poolAddress, wallet, tracked, poolMeta, reason, txHashes, swappedToMint })
-    .catch((e) => log("close_warn", `Zap-out PnL fetch failed: ${e.message}`));
+  // ── PnL fetch — bounded (up to 15s, 3 attempts) ───────────────
+  // Try to get settled closed PnL from the API.  If it hasn't settled yet,
+  // fall back to the pre-close snapshot so the notification shows real data.
+  let pnlUsd      = solMode ? preClosePnlSol : preClosePnlTrueUsd;
+  let pnlTrueUsd  = preClosePnlTrueUsd;
+  let pnlSol      = preClosePnlSol;
+  let pnlPct      = preClosePnlPct;
+  let finalValueUsd = preCloseTrueValue;
+  let initialUsd  = initialUsdTracked || preCloseTrueValue;
+  let feesUsd     = preCloseFeesUsd;
+  let finalValueSol = preCloseTotalValue;
+  let initialSol  = initialSolTracked || preCloseTotalValue;
+  let feesSol     = preCloseFeesSol;
+
+  if (tracked) {
+    try {
+      const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const res = await fetch(closedUrl);
+        if (res.ok) {
+          const data = await res.json();
+          const posEntry = (data.positions || []).find((entry) => entry.positionAddress === position_address);
+          if (posEntry) {
+            const totals = getClosedAmountTotals(posEntry);
+            pnlTrueUsd  = totals.pnlUsd;
+            pnlSol      = totals.pnlSol;
+            pnlUsd      = solMode ? pnlSol : pnlTrueUsd;
+            pnlPct      = getClosedPnlPct(posEntry, solMode);
+            finalValueUsd = totals.finalUsd;
+            initialUsd  = totals.initialUsd || initialUsdTracked;
+            feesUsd     = totals.feesUsd || feesUsd;
+            finalValueSol = totals.finalSol;
+            initialSol  = totals.initialSol || initialSolTracked;
+            feesSol     = totals.feesSol;
+            log("close", `Zap-out closed PnL: ${pnlUsd.toFixed(2)} ${solMode ? "SOL" : "USD"} (${pnlPct.toFixed(2)}%)`);
+            break;
+          }
+        }
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 5000));
+      }
+    } catch (e) {
+      log("close_warn", `Zap-out closed PnL fetch failed: ${e.message}`);
+    }
+
+    // Record performance + decision log (non-blocking)
+    fetchClosedPnL({ position_address, poolAddress, wallet, tracked, poolMeta, reason, txHashes, swappedToMint })
+      .catch((e) => log("close_warn", `Zap-out PnL background record failed: ${e.message}`));
+  }
 
   return {
     success: true,
@@ -2071,6 +2169,16 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
     swapped_to: swappedToMint,
     auto_swapped: true,  // signal executor to skip post-close swap
     auto_swap_note: "Base token already swapped to SOL via zap-out. Do NOT call swap_token again.",
+    pnl_usd: pnlUsd,
+    pnl_pct: pnlPct,
+    pnl_true_usd: pnlTrueUsd,
+    pnl_sol: pnlSol,
+    initial_value_usd: initialUsd,
+    final_value_usd: finalValueUsd,
+    initial_value_sol: initialSol,
+    final_value_sol: finalValueSol,
+    fees_usd: feesUsd,
+    fees_sol: feesSol,
   };
 }
 

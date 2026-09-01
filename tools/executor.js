@@ -686,6 +686,19 @@ export async function executeTool(name, args) {
     }
   }
 
+  // ─── Pre-execution snapshot for close_position ──────
+  // Fetch position data BEFORE the close runs — after the close txs confirm,
+  // the position is gone from the API and PnL fallback data would be empty.
+  let preClosePos = null;
+  if (name === "close_position" && args.position_address) {
+    try {
+      const positions = await getMyPositions({ force: true, silent: true });
+      preClosePos = positions.positions?.find(p => p.position === args.position_address) || null;
+    } catch (e) {
+      log("executor_warn", `Failed to get pre-close position data: ${e.message}`);
+    }
+  }
+
   // ─── Execute ──────────────────────────────
   try {
     const result = await fn(args);
@@ -706,22 +719,10 @@ export async function executeTool(name, args) {
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
-        // Get position data BEFORE closing for fallback
-        let preClosePnlUsd = 0;
-        let preClosePnlPct = 0;
-        let preCloseValueUsd = 0;
-        let preClosePos = null;
-        try {
-          const positions = await getMyPositions({ force: true, silent: true });
-          preClosePos = positions.positions?.find(p => p.position === args.position_address);
-          if (preClosePos) {
-            preClosePnlUsd = preClosePos.pnl_usd ?? 0;
-            preClosePnlPct = preClosePos.pnl_pct ?? 0;
-            preCloseValueUsd = preClosePos.total_value_usd ?? 0;
-          }
-        } catch (e) {
-          log("executor_warn", `Failed to get pre-close position data: ${e.message}`);
-        }
+        // preClosePos was fetched BEFORE the close ran (see above)
+        let preClosePnlUsd = preClosePos?.pnl_usd ?? 0;
+        let preClosePnlPct = preClosePos?.pnl_pct ?? 0;
+        let preCloseValueUsd = preClosePos?.total_value_usd ?? 0;
         
         // Prepare detailed notification data
         const { getTrackedPosition } = await import("../state.js");
