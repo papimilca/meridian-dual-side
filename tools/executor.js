@@ -734,10 +734,10 @@ export async function executeTool(name, args) {
           if (poolAddr) addPoolNote({ pool_address: poolAddr, note: `Closed: low yield (fee/TVL below threshold) at ${new Date().toISOString().slice(0,10)}` }).catch?.(() => {});
         }
         
-        // Auto-swap base token back to SOL unless user said to hold (retried).
+        // Auto-swap base token back to SOL unless user said to hold or zap-out already swapped.
         let swapAmountSol = null;
         let swapSymbol = null;
-        if (!args.skip_swap && result.base_mint) {
+        if (!args.skip_swap && result.base_mint && !result.auto_swapped) {
           const { swapped, result: swapResult, token } = await swapBaseToSolWithRetry(result.base_mint, "after close");
           if (swapped) {
             // Tell the model the swap already happened so it doesn't call swap_token again

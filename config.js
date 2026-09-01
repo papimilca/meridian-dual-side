@@ -162,6 +162,13 @@ export const config = {
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
+    // Zap-out fast close: uses @meteora-ag/zap-sdk to remove liquidity + swap base→SOL
+    // atomically in a single transaction, eliminating sequential claim→remove→swap drift.
+    zapOutEnabled:         u.zapOutEnabled         ?? true,
+    // Slippage tolerance (bps) for the Jupiter swap inside the zap-out tx (500 = 5%)
+    zapOutSlippageBps:     u.zapOutSlippageBps     ?? 500,
+    // Max accounts for Jupiter quote — keeps tx size reasonable
+    zapOutMaxAccounts:     u.zapOutMaxAccounts     ?? 50,
   },
 
   // ─── Strategy Mapping ───────────────────

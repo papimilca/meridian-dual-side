@@ -63,6 +63,10 @@
   "pnlSanityMaxDiffPct": 5,
   "solMode": false,
 
+  "zapOutEnabled": true,
+  "zapOutSlippageBps": 500,
+  "zapOutMaxAccounts": 50,
+
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,
   "healthCheckIntervalMin": 60,

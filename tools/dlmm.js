@@ -25,7 +25,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint } from "./wallet.js";
+import { normalizeMint, getJupiterApiKey, getJupiterApiUrl } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
@@ -72,6 +72,24 @@ async function getDLMM() {
     BIN_ARRAY_FEE: _BIN_ARRAY_FEE,
     BIN_ARRAY_BITMAP_FEE: _BIN_ARRAY_BITMAP_FEE,
   };
+}
+
+// ─── Lazy zap-sdk loader ──────────────────────────────────────
+// @meteora-ag/zap-sdk → @coral-xyz/anchor uses CJS that breaks ESM on Node 24.
+// Dynamic import defers loading until an actual zap-out is needed.
+let _zap = null;
+async function getZap() {
+  if (!_zap) {
+    const mod = await import("@meteora-ag/zap-sdk");
+    _zap = {
+      Zap: mod.Zap,
+      getJupiterQuote: mod.getJupiterQuote,
+      getJupiterSwapInstruction: mod.getJupiterSwapInstruction,
+      getTokenProgramFromMint: mod.getTokenProgramFromMint,
+      ZAP_PROGRAM_ID: mod.ZAP_PROGRAM_ID,
+    };
+  }
+  return _zap;
 }
 
 // ─── Lazy wallet/connection init ──────────────────────────────
@@ -1853,6 +1871,333 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
+
+/**
+ * Fast close path using @meteora-ag/zap-sdk.
+ *
+ * Removes all liquidity, claims residual fees, closes the position NFT, and
+ * swaps the withdrawn base token → SOL in a SINGLE atomic transaction via the
+ * Meteora Zap program + Jupiter v6.  Eliminates the multi-tx sequential drift
+ * (claim → remove → wait → swap) that causes slippage in tight ranges.
+ *
+ * Returns { success, zapOut: true, ... } on success, or throws on failure
+ * (caller falls back to legacy multi-step path).
+ */
+async function closePositionWithZapOut({ position_address, reason, poolAddress, pool, tracked, poolMeta, livePosition }) {
+  const wallet = getWallet();
+  const connection = getConnection();
+
+  const { Zap, getJupiterQuote, getJupiterSwapInstruction, getTokenProgramFromMint } = await getZap();
+
+  const tokenXMint = pool.lbPair.tokenXMint;        // base token
+  const tokenYMint = pool.lbPair.tokenYMint;        // quote token (SOL/USDC/USDT)
+  const SOL_MINT = new PublicKey(config.tokens.SOL);
+
+  // ── Determine position bin range ──────────────────────────────
+  const closeFromBinId = livePosition?.lower_bin ?? tracked?.bin_range?.min ?? -887272;
+  const closeToBinId   = livePosition?.upper_bin ?? tracked?.bin_range?.max ?? 887272;
+
+  // ── Step 1: Remove liquidity (keep position open for zap-out) ──
+  // Unlike the legacy path, we do NOT set shouldClaimAndClose here — the zap
+  // program handles token flow atomically.  We remove 100% liquidity so the
+  // withdrawn tokens land in the wallet ATA, then feed them to zap-out.
+  log("close", `Zap-out: removing liquidity from ${position_address.slice(0, 8)} (bins ${closeFromBinId}→${closeToBinId})`);
+
+  const positionPubKey = new PublicKey(position_address);
+  const positionData = await pool.getPosition(positionPubKey);
+
+  // Calculate total amounts to be withdrawn
+  let totalAmountX = new BN(0);
+  let totalAmountY = new BN(0);
+  const bins = Array.isArray(positionData?.positionData?.positionBinData) ? positionData.positionData.positionBinData : [];
+  for (const bin of bins) {
+    totalAmountX = totalAmountX.add(new BN(bin.positionXAmount || "0"));
+    totalAmountY = totalAmountY.add(new BN(bin.positionYAmount || "0"));
+  }
+
+  const removeLiquidityTxs = await pool.removeLiquidity({
+    user: wallet.publicKey,
+    position: positionPubKey,
+    fromBinId: closeFromBinId,
+    toBinId: closeToBinId,
+    bps: new BN(10000),
+    shouldClaimAndClose: true,   // claim fees + close NFT account in same tx batch
+  });
+
+  const removeTxArray = Array.isArray(removeLiquidityTxs) ? removeLiquidityTxs : [removeLiquidityTxs];
+  const txHashes = [];
+  for (const tx of removeTxArray) {
+    const txHash = await sendAndConfirmTransaction(connection, tx, [wallet]);
+    txHashes.push(txHash);
+  }
+  log("close", `Zap-out: liquidity removed in ${txHashes.length} tx(s): ${txHashes.join(", ")}`);
+
+  // ── Step 2: Build zap-out tx (Jupiter swap via Zap program) ────
+  // If we got base token (X) out, swap it → SOL via Jupiter through the Zap
+  // program so the ledger tracks it.  If we only got quote token (Y) and it's
+  // already SOL, skip the swap — no zap needed.
+  const hasBaseToken = totalAmountX.gt(new BN(0));
+  let zapTxHash = null;
+  let swappedToMint = null;
+
+  if (hasBaseToken && !tokenXMint.equals(SOL_MINT)) {
+    log("close", `Zap-out: swapping withdrawn base token (${totalAmountX.toString()} lamports) → SOL via Jupiter`);
+
+    const zapClient = new Zap(connection, {
+      jupiterApiUrl: getJupiterApiUrl(),
+      jupiterApiKey: getJupiterApiKey(),
+    });
+
+    const slippageBps = Number(config.management.zapOutSlippageBps ?? 500);
+    const maxAccounts = Number(config.management.zapOutMaxAccounts ?? 50);
+
+    // Get Jupiter quote for base token → SOL
+    const quoteResponse = await getJupiterQuote(
+      tokenXMint,           // input mint (base token)
+      SOL_MINT,             // output mint (SOL)
+      totalAmountX,         // amount in (lamports)
+      maxAccounts,          // max accounts
+      slippageBps,          // slippage bps
+      false,                // dynamic slippage
+      true,                 // only direct routes
+      true,                 // restrict intermediate tokens
+      false,                // forJitoBundle
+      {
+        jupiterApiUrl: getJupiterApiUrl(),
+        jupiterApiKey: getJupiterApiKey(),
+      },
+    );
+
+    if (!quoteResponse) {
+      throw new Error("Zap-out: Jupiter returned no quote for base token → SOL");
+    }
+
+    // Get swap instruction from Jupiter
+    const swapInstructionResponse = await getJupiterSwapInstruction(
+      wallet.publicKey,
+      quoteResponse,
+      {
+        jupiterApiUrl: getJupiterApiUrl(),
+        jupiterApiKey: getJupiterApiKey(),
+      },
+    );
+
+    // Get token programs
+    const inputTokenProgram = await getTokenProgramFromMint(connection, tokenXMint);
+    const outputTokenProgram = await getTokenProgramFromMint(connection, SOL_MINT);
+
+    // Build the atomic zap-out transaction
+    const zapOutTx = await zapClient.zapOutThroughJupiter({
+      user: wallet.publicKey,
+      inputMint: tokenXMint,
+      outputMint: SOL_MINT,
+      inputTokenProgram,
+      outputTokenProgram,
+      jupiterSwapResponse: swapInstructionResponse,
+      maxSwapAmount: new BN(quoteResponse.inAmount),
+      percentageToZapOut: 100,
+    });
+
+    // Sign and send the zap-out tx
+    const { blockhash } = await connection.getLatestBlockhash();
+    zapOutTx.recentBlockhash = blockhash;
+    zapOutTx.feePayer = wallet.publicKey;
+
+    zapTxHash = await sendAndConfirmTransaction(connection, zapOutTx, [wallet]);
+    txHashes.push(zapTxHash);
+    swappedToMint = "SOL";
+    log("close", `Zap-out: swap tx confirmed: ${zapTxHash}`);
+  } else if (tokenXMint.equals(SOL_MINT)) {
+    // Base token IS SOL — nothing to swap
+    log("close", `Zap-out: base token is SOL, no swap needed`);
+    swappedToMint = "SOL";
+  } else {
+    // No base token withdrawn (position was all quote-side) — skip swap
+    log("close", `Zap-out: no base token to swap (position was quote-side only)`);
+    swappedToMint = tokenYMint.toString();
+  }
+
+  // ── Step 3: Close position NFT account if not already closed ──
+  // shouldClaimAndClose in removeLiquidity should have already closed it,
+  // but verify and close manually if needed.
+  _positionsCacheAt = 0;
+  let closedConfirmed = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const refreshed = await getMyPositions({ force: true, silent: true });
+      const stillOpen = refreshed?.positions?.some((p) => p.position === position_address);
+      if (!stillOpen) {
+        closedConfirmed = true;
+        break;
+      }
+      log("close_warn", `Zap-out: position still open after txs (attempt ${attempt + 1}/3)`);
+    } catch (e) {
+      log("close_warn", `Zap-out verification failed (attempt ${attempt + 1}/3): ${e.message}`);
+    }
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  if (!closedConfirmed) {
+    // Position account might still be open — try explicit close
+    try {
+      log("close", `Zap-out: attempting explicit position account close`);
+      const closeTx = await pool.closePosition({
+        owner: wallet.publicKey,
+        position: { publicKey: positionPubKey },
+      });
+      const closeTxHash = await sendAndConfirmTransaction(connection, closeTx, [wallet]);
+      txHashes.push(closeTxHash);
+    } catch (e) {
+      log("close_warn", `Zap-out: explicit close failed (may already be closed): ${e.message}`);
+    }
+  }
+
+  recordClose(position_address, reason || "agent decision");
+
+  // ── PnL fetch — fire and forget (non-blocking) ───────────────
+  // Don't block the return on PnL settling; fetch in background.
+  fetchClosedPnL({ position_address, poolAddress, wallet, tracked, poolMeta, reason, txHashes, swappedToMint })
+    .catch((e) => log("close_warn", `Zap-out PnL fetch failed: ${e.message}`));
+
+  return {
+    success: true,
+    zapOut: true,
+    position: position_address,
+    pool: poolAddress,
+    pool_name: tracked?.pool_name || poolMeta?.name || null,
+    close_txs: txHashes,
+    txs: txHashes,
+    base_mint: tokenXMint.toString(),
+    swapped_to: swappedToMint,
+    auto_swapped: true,  // signal executor to skip post-close swap
+    auto_swap_note: "Base token already swapped to SOL via zap-out. Do NOT call swap_token again.",
+  };
+}
+
+/**
+ * Fetch closed PnL from Meteora API in the background.
+ * Non-blocking — runs after closePosition returns so the bot can proceed.
+ */
+async function fetchClosedPnL({ position_address, poolAddress, wallet, tracked, poolMeta, reason, txHashes, swappedToMint }) {
+  if (!tracked) {
+    appendDecision({
+      type: "close",
+      actor: "MANAGER",
+      pool: poolAddress,
+      pool_name: poolMeta?.name || poolAddress.slice(0, 8),
+      position: position_address,
+      summary: "Zap-out closed position",
+      reason: reason || "agent decision",
+      metrics: {},
+    });
+    return;
+  }
+
+  const deployedAt = new Date(tracked.deployed_at).getTime();
+  const minutesHeld = Math.floor((Date.now() - deployedAt) / 60000);
+  let minutesOOR = 0;
+  if (tracked.out_of_range_since) {
+    minutesOOR = Math.floor((Date.now() - new Date(tracked.out_of_range_since).getTime()) / 60000);
+  }
+
+  // Fetch closed PnL from API — retry up to 4 times
+  let pnlUsd = 0, pnlTrueUsd = 0, pnlPct = 0, finalValueUsd = 0, initialUsd = 0;
+  let feesUsd = tracked.total_fees_claimed_usd || 0;
+  let pnlSol = 0, finalValueSol = 0, initialSol = tracked.amount_sol || 0, feesSol = 0;
+
+  try {
+    const closedUrl = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${wallet.publicKey.toString()}&status=closed&pageSize=50&page=1`;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const res = await fetch(closedUrl);
+      if (res.ok) {
+        const data = await res.json();
+        const posEntry = (data.positions || []).find((entry) => entry.positionAddress === position_address);
+        if (posEntry) {
+          const totals = getClosedAmountTotals(posEntry);
+          pnlTrueUsd = totals.pnlUsd;
+          pnlSol = totals.pnlSol;
+          pnlUsd = config.management.solMode ? pnlSol : pnlTrueUsd;
+          pnlPct = getClosedPnlPct(posEntry, config.management.solMode);
+          finalValueUsd = totals.finalUsd;
+          initialUsd = totals.initialUsd;
+          feesUsd = totals.feesUsd || feesUsd;
+          finalValueSol = totals.finalSol;
+          initialSol = totals.initialSol || initialSol;
+          feesSol = totals.feesSol;
+          log("close", `Zap-out closed PnL: ${pnlUsd.toFixed(2)} ${config.management.solMode ? "SOL" : "USD"} (${pnlPct.toFixed(2)}%)`);
+          break;
+        }
+      }
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 5000));
+    }
+  } catch (e) {
+    log("close_warn", `Zap-out closed PnL fetch failed: ${e.message}`);
+  }
+
+  const closeBaseMint = pool.lbPair.tokenXMint.toString();
+
+  let exitMarket = {};
+  try {
+    const exitDetail = await fetch(`https://pool-discovery-api.datapi.meteora.ag/pools?page_size=1&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}&timeframe=${encodeURIComponent(config.screening?.timeframe || "5m")}`).then(r => r.json()).catch(() => null);
+    const ep = exitDetail?.data?.[0];
+    if (ep) {
+      exitMarket = {
+        exit_mcap: parseFloat(ep?.token_x?.market_cap) || null,
+        exit_tvl: parseFloat(ep?.tvl ?? ep?.active_tvl) || null,
+        exit_volume: parseFloat(ep?.volume) || null,
+      };
+    }
+  } catch { /* non-blocking */ }
+
+  const signalSnapshot = resolvePerformanceSignalSnapshot({ poolAddress, baseMint: closeBaseMint, tracked });
+
+  await recordPerformance({
+    position: position_address,
+    pool: poolAddress,
+    pool_name: tracked.pool_name || poolMeta?.name || poolAddress.slice(0, 8),
+    base_mint: closeBaseMint,
+    strategy: tracked.strategy,
+    bin_range: tracked.bin_range,
+    bin_step: tracked.bin_step || null,
+    volatility: tracked.volatility ?? null,
+    fee_tvl_ratio: tracked.fee_tvl_ratio || null,
+    organic_score: tracked.organic_score || null,
+    amount_sol: tracked.amount_sol,
+    fees_earned_usd: feesUsd,
+    final_value_usd: finalValueUsd,
+    initial_value_usd: initialUsd,
+    minutes_in_range: minutesHeld - minutesOOR,
+    minutes_held: minutesHeld,
+    close_reason: reason || "agent decision",
+    signal_snapshot: signalSnapshot,
+    entry_mcap: tracked.entry_mcap ?? null,
+    entry_tvl: tracked.entry_tvl ?? null,
+    entry_volume: tracked.entry_volume ?? null,
+    entry_holders: tracked.entry_holders ?? null,
+    ...exitMarket,
+  });
+
+  appendDecision({
+    type: "close",
+    actor: "MANAGER",
+    pool: poolAddress,
+    pool_name: tracked.pool_name || poolMeta?.name || poolAddress.slice(0, 8),
+    position: position_address,
+    summary: `Zap-out closed at ${pnlPct.toFixed(2)}%`,
+    reason: reason || "agent decision",
+    risks: [
+      minutesOOR > 0 ? `out of range ${minutesOOR}m` : null,
+      tracked.volatility != null ? `volatility ${tracked.volatility}` : null,
+    ].filter(Boolean),
+    metrics: {
+      pnl_usd: pnlUsd,
+      pnl_pct: pnlPct,
+      fees_usd: feesUsd,
+      minutes_held: minutesHeld,
+    },
+  });
+}
+
 export async function closePosition({ position_address, reason }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
@@ -2146,6 +2491,29 @@ export async function closePosition({ position_address, reason }) {
       } catch (relayError) {
         if (relaySubmitted) throw relayError;
         log("close_warn", `Relay zap-out failed before submit; falling back to local close + Jupiter autoswap: ${relayError.message}`);
+      }
+    }
+
+    // ─── Zap-out fast path (atomic remove + swap via @meteora-ag/zap-sdk) ──
+    // Skips the multi-step claim → remove → wait → swap sequence that causes
+    // drift in tight ranges.  Falls back to legacy path on any failure.
+    if (config.management.zapOutEnabled !== false) {
+      try {
+        const livePositions = await getMyPositions({ force: true, silent: true });
+        const livePosition = livePositions?.positions?.find((p) => p.position === position_address);
+        const pool = await getPool(poolAddress);
+        return await closePositionWithZapOut({
+          position_address,
+          reason,
+          poolAddress,
+          pool,
+          tracked,
+          poolMeta,
+          livePosition,
+        });
+      } catch (zapError) {
+        log("close_warn", `Zap-out fast close failed; falling back to legacy path: ${zapError.message}`);
+        // Fall through to legacy path below
       }
     }
 
