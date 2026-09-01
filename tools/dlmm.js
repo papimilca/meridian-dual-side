@@ -25,7 +25,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint, getJupiterApiKey, getJupiterApiUrl } from "./wallet.js";
+import { normalizeMint, getJupiterApiKey, getJupiterApiUrl, swapToken, getWalletBalances } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
@@ -86,6 +86,11 @@ async function getZap() {
       getJupiterQuote: mod.getJupiterQuote,
       getJupiterSwapInstruction: mod.getJupiterSwapInstruction,
       getTokenProgramFromMint: mod.getTokenProgramFromMint,
+      getOrCreateATAInstruction: mod.getOrCreateATAInstruction,
+      getTokenAccountBalance: mod.getTokenAccountBalance,
+      unwrapSOLInstruction: mod.unwrapSOLInstruction,
+      AMOUNT_IN_JUP_V6_REVERSE_OFFSET: mod.AMOUNT_IN_JUP_V6_REVERSE_OFFSET,
+      JUP_V6_PROGRAM_ID: mod.JUP_V6_PROGRAM_ID,
       ZAP_PROGRAM_ID: mod.ZAP_PROGRAM_ID,
     };
   }
@@ -1887,7 +1892,7 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
   const wallet = getWallet();
   const connection = getConnection();
 
-  const { Zap, getJupiterQuote, getJupiterSwapInstruction, getTokenProgramFromMint } = await getZap();
+  const { Zap, getJupiterQuote, getJupiterSwapInstruction, getTokenProgramFromMint, getOrCreateATAInstruction, getTokenAccountBalance, unwrapSOLInstruction, AMOUNT_IN_JUP_V6_REVERSE_OFFSET, JUP_V6_PROGRAM_ID } = await getZap();
 
   const tokenXMint = pool.lbPair.tokenXMint;        // base token
   const tokenYMint = pool.lbPair.tokenYMint;        // quote token (SOL/USDC/USDT)
@@ -1928,6 +1933,36 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
   for (const bin of bins) {
     totalAmountX = totalAmountX.add(new BN(bin.positionXAmount || "0"));
     totalAmountY = totalAmountY.add(new BN(bin.positionYAmount || "0"));
+  }
+
+  // ── Pre-removal balance snapshot (CRITICAL) ────────────────────
+  // The zap program swaps (on-chain balance − preUserTokenBalance).  The
+  // balance MUST be read BEFORE the remove-liquidity tx confirms, otherwise
+  // the delta is 0 and the zap-out swaps nothing (tx confirms, no swap).
+  const needsZapSwap = totalAmountX.gt(new BN(0)) && !tokenXMint.equals(SOL_MINT);
+  let zapInputAta = null;
+  let zapPreBalance = new BN(0);
+  let zapInputAtaIx = null;
+  let zapOutputAtaIx = null;
+  let zapInputTokenProgram = null;
+  let zapOutputTokenProgram = null;
+
+  if (needsZapSwap) {
+    zapInputTokenProgram = await getTokenProgramFromMint(connection, tokenXMint);
+    zapOutputTokenProgram = await getTokenProgramFromMint(connection, SOL_MINT);
+    const [inputAtaInfo, outputAtaInfo] = await Promise.all([
+      getOrCreateATAInstruction(connection, tokenXMint, wallet.publicKey, wallet.publicKey, true, zapInputTokenProgram),
+      getOrCreateATAInstruction(connection, SOL_MINT, wallet.publicKey, wallet.publicKey, true, zapOutputTokenProgram),
+    ]);
+    zapInputAta = inputAtaInfo.ataPubkey;
+    zapInputAtaIx = inputAtaInfo.ix || null;
+    zapOutputAtaIx = outputAtaInfo.ix || null;
+    try {
+      zapPreBalance = new BN(await getTokenAccountBalance(connection, zapInputAta));
+    } catch {
+      zapPreBalance = new BN(0); // ATA doesn't exist yet → zero balance
+    }
+    log("close", `Zap-out: pre-removal base token balance snapshot: ${zapPreBalance.toString()} lamports`);
   }
 
   const removeLiquidityTxs = await pool.removeLiquidity({
@@ -1997,20 +2032,44 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
       },
     );
 
-    // Get token programs
-    const inputTokenProgram = await getTokenProgramFromMint(connection, tokenXMint);
-    const outputTokenProgram = await getTokenProgramFromMint(connection, SOL_MINT);
+    // ── Build zap-out tx with the PRE-REMOVAL balance snapshot ───
+    // zapOutThroughJupiter() re-reads the token balance internally — by now
+    // the remove tx already confirmed, so its delta would be 0 and nothing
+    // would swap.  We call the generic zapOut() directly with the balance
+    // captured BEFORE removal so the zap program sees the withdrawn tokens
+    // as new balance.
+    const remainingAccounts = swapInstructionResponse.swapInstruction.accounts.map((acc) => ({
+      pubkey: typeof acc.pubkey === "string" ? new PublicKey(acc.pubkey) : acc.pubkey,
+      isSigner: acc.isSigner,
+      isWritable: acc.isWritable,
+    }));
+    const payloadData = Buffer.from(swapInstructionResponse.swapInstruction.data, "base64");
+    const offsetAmountIn = payloadData.length - AMOUNT_IN_JUP_V6_REVERSE_OFFSET;
 
-    // Build the atomic zap-out transaction
-    const zapOutTx = await zapClient.zapOutThroughJupiter({
-      user: wallet.publicKey,
-      inputMint: tokenXMint,
-      outputMint: SOL_MINT,
-      inputTokenProgram,
-      outputTokenProgram,
-      jupiterSwapResponse: swapInstructionResponse,
-      maxSwapAmount: new BN(quoteResponse.inAmount),
-      percentageToZapOut: 100,
+    const zapPreInstructions = [];
+    if (zapInputAtaIx) zapPreInstructions.push(zapInputAtaIx);
+    if (zapOutputAtaIx) zapPreInstructions.push(zapOutputAtaIx);
+    const zapPostInstructions = [];
+    const unwrapIx = unwrapSOLInstruction(wallet.publicKey, wallet.publicKey);
+    if (unwrapIx) zapPostInstructions.push(unwrapIx); // output is wSOL → unwrap to native SOL
+
+    // Cap covers pre-existing dust + withdrawn liquidity (claimed fees beyond
+    // this cap are picked up by the manual fallback swap below).
+    const maxSwapAmount = zapPreBalance.add(totalAmountX);
+
+    const zapOutTx = await zapClient.zapOut({
+      userTokenInAccount: zapInputAta,
+      zapOutParams: {
+        percentage: 100,
+        offsetAmountIn,
+        preUserTokenBalance: zapPreBalance,
+        maxSwapAmount,
+        payloadData,
+      },
+      remainingAccounts,
+      ammProgram: JUP_V6_PROGRAM_ID,
+      preInstructions: zapPreInstructions,
+      postInstructions: zapPostInstructions,
     });
 
     // ── Add Jupiter compute budget + setup instructions ──────────
@@ -2061,6 +2120,37 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
     txHashes.push(zapTxHash);
     swappedToMint = "SOL";
     log("close", `Zap-out: swap tx confirmed: ${zapTxHash}`);
+
+    // ── Fallback: verify the zap actually swapped; manual swap if not ──
+    // The zap tx can confirm without swapping (delta=0 edge cases, partial
+    // cap, claimed fees beyond maxSwapAmount).  Check the leftover base
+    // token balance and swap it manually via Jupiter if it's still worth
+    // swapping (≥ $0.10).
+    try {
+      await new Promise((r) => setTimeout(r, 1500)); // let RPC index the zap tx
+      const balances = await getWalletBalances({});
+      const leftover = balances.tokens?.find((t) => t.mint === tokenXMint.toString());
+      if (leftover && (leftover.balance ?? 0) > 0 && (leftover.usd ?? 0) >= 0.10) {
+        log("close_warn", `Zap-out: leftover ${leftover.symbol || tokenXMint.toString().slice(0, 8)} ($${leftover.usd.toFixed(2)}) still unswapped — running manual fallback swap`);
+        const fallbackRes = await swapToken({
+          input_mint: tokenXMint.toString(),
+          output_mint: "SOL",
+          amount: leftover.balance,
+        });
+        if (fallbackRes && fallbackRes.success !== false && !fallbackRes.error) {
+          txHashes.push(fallbackRes.tx);
+          log("close", `Zap-out fallback swap confirmed: ${fallbackRes.tx} (out: ${fallbackRes.amount_out})`);
+        } else {
+          // Signal executor to retry the auto-swap path
+          log("close_warn", `Zap-out fallback swap failed: ${fallbackRes?.error || "unknown"}`);
+          swappedToMint = null;
+        }
+      } else {
+        log("close", `Zap-out: leftover base token check OK (balance ${leftover?.balance ?? 0}, $${(leftover?.usd ?? 0).toFixed(2)} — below swap threshold)`);
+      }
+    } catch (e) {
+      log("close_warn", `Zap-out leftover check failed: ${e.message}`);
+    }
   } else if (tokenXMint.equals(SOL_MINT)) {
     // Base token IS SOL — nothing to swap
     log("close", `Zap-out: base token is SOL, no swap needed`);
@@ -2153,7 +2243,7 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
     }
 
     // Record performance + decision log (non-blocking)
-    fetchClosedPnL({ position_address, poolAddress, wallet, tracked, poolMeta, reason, txHashes, swappedToMint })
+    fetchClosedPnL({ position_address, poolAddress, pool, tracked, poolMeta, reason, txHashes, swappedToMint })
       .catch((e) => log("close_warn", `Zap-out PnL background record failed: ${e.message}`));
   }
 
@@ -2167,8 +2257,10 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
     txs: txHashes,
     base_mint: tokenXMint.toString(),
     swapped_to: swappedToMint,
-    auto_swapped: true,  // signal executor to skip post-close swap
-    auto_swap_note: "Base token already swapped to SOL via zap-out. Do NOT call swap_token again.",
+    auto_swapped: swappedToMint === "SOL",  // signal executor to skip post-close swap if zap/fallback succeeded
+    auto_swap_note: swappedToMint === "SOL"
+      ? "Base token already swapped to SOL via zap-out. Do NOT call swap_token again."
+      : "Zap-out swap incomplete — executor should attempt manual auto-swap.",
     pnl_usd: pnlUsd,
     pnl_pct: pnlPct,
     pnl_true_usd: pnlTrueUsd,
@@ -2186,7 +2278,7 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
  * Fetch closed PnL from Meteora API in the background.
  * Non-blocking — runs after closePosition returns so the bot can proceed.
  */
-async function fetchClosedPnL({ position_address, poolAddress, wallet, tracked, poolMeta, reason, txHashes, swappedToMint }) {
+async function fetchClosedPnL({ position_address, poolAddress, pool, wallet, tracked, poolMeta, reason, txHashes, swappedToMint }) {
   if (!tracked) {
     appendDecision({
       type: "close",
