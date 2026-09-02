@@ -11,6 +11,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { repoPath } from "./repo-root.js";
+import { oorWaitMinutesFor } from "./config.js";
 
 const STATE_FILE = repoPath("state.json");
 
