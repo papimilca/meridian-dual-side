@@ -8,7 +8,7 @@ import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances, swapToken } from "./tools/wallet.js";
 import { getTopCandidates, degenScore } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount, ABS_MIN_BINS_BELOW } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, oorWaitMinutesFor, ABS_MIN_BINS_BELOW } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import {
@@ -382,7 +382,7 @@ export async function runManagementCycle({ silent = false } = {}) {
         else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
       }
       for (const p of positions) {
-        if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
+        if (!p.in_range && p.minutes_out_of_range >= oorWaitMinutesFor(p)) {
           notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
         }
       }
@@ -991,15 +991,15 @@ function getDeterministicCloseRule(position, managementConfig) {
     position.active_bin != null &&
     position.upper_bin != null &&
     position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose &&
-    (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
+    (position.minutes_out_of_range ?? 0) >= oorWaitMinutesFor(position, managementConfig)
   ) {
     return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
   }
   if (
     position.active_bin != null &&
-    position.upper_bin != null &&
-    position.active_bin > position.upper_bin &&
-    (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
+    ((position.upper_bin != null && position.active_bin > position.upper_bin) ||
+      (position.lower_bin != null && position.active_bin < position.lower_bin)) &&
+    (position.minutes_out_of_range ?? 0) >= oorWaitMinutesFor(position, managementConfig)
   ) {
     return { action: "CLOSE", rule: 4, reason: "OOR" };
   }

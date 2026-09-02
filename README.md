@@ -451,7 +451,7 @@ Meridian does **not** auto-register the first chat for safety — you must set `
 Meridian sends notifications automatically for:
 - Management cycle reports (reasoning + decisions)
 - Screening cycle reports (what it found, whether it deployed)
-- OOR alerts when a position leaves range past `outOfRangeWaitMinutes`
+- OOR alerts when a position leaves range past `outOfRangeWaitMinutesAbove`/`outOfRangeWaitMinutesBelow`
 - Deploy: pair, amount, position address, tx hash
 - Close: pair and PnL
 
@@ -501,7 +501,8 @@ All fields are optional — defaults shown. Edit `user-config.json`.
 | `maxDeployAmount` | `50` | Maximum SOL cap per position |
 | `gasReserve` | `0.2` | Minimum SOL to keep for gas |
 | `minSolToOpen` | `0.55` | Minimum wallet SOL before opening |
-| `outOfRangeWaitMinutes` | `30` | Minutes OOR before acting |
+| `outOfRangeWaitMinutesAbove` | `5` | Minutes OOR above range (active_bin > upper_bin) before acting |
+| `outOfRangeWaitMinutesBelow` | `15` | Minutes OOR below range (active_bin < lower_bin) before acting |
 | `stopLossPct` | `-15` | Close position if price drops by this % |
 | `takeProfitPct` | `5` | Close when fees earned reach this % of capital |
 | `trailingTakeProfit` | `true` | Enable trailing take-profit |

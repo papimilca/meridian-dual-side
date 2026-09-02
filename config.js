@@ -137,6 +137,10 @@ export const config = {
     autoSwapRetryDelayMs:  u.autoSwapRetryDelayMs  ?? 3000, // delay between auto-swap retries
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
+    // Directional OOR waits — above = price above range (active_bin > upper_bin),
+    // below = price below range (active_bin < lower_bin). Fall back to outOfRangeWaitMinutes.
+    outOfRangeWaitMinutesAbove: u.outOfRangeWaitMinutesAbove ?? u.outOfRangeWaitMinutes ?? 30,
+    outOfRangeWaitMinutesBelow: u.outOfRangeWaitMinutesBelow ?? u.outOfRangeWaitMinutes ?? 30,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
@@ -302,6 +306,20 @@ export const config = {
 };
 
 /**
+ * Direction-aware OOR wait: how long a position may stay out of range before acting.
+ * Above range (price pumped past upper bin) uses outOfRangeWaitMinutesAbove,
+ * below range (price dumped past lower bin) uses outOfRangeWaitMinutesBelow.
+ */
+export function oorWaitMinutesFor(position, mgmt = config.management) {
+  const fallback = mgmt.outOfRangeWaitMinutes ?? 30;
+  const above = mgmt.outOfRangeWaitMinutesAbove ?? fallback;
+  const below = mgmt.outOfRangeWaitMinutesBelow ?? fallback;
+  if (position?.active_bin != null && position?.upper_bin != null && position.active_bin > position.upper_bin) return above;
+  if (position?.active_bin != null && position?.lower_bin != null && position.active_bin < position.lower_bin) return below;
+  return fallback;
+}
+
+/**
  * Compute the deploy amount for a given wallet balance.
  *
  * Fixed mode (deployAmountSol explicitly set in user-config or via update_config):
@@ -373,6 +391,8 @@ export function reloadScreeningThresholds() {
     if (fresh.autoSwapRetryDelayMs  != null) m.autoSwapRetryDelayMs  = fresh.autoSwapRetryDelayMs;
     if (fresh.outOfRangeBinsToClose != null) m.outOfRangeBinsToClose = fresh.outOfRangeBinsToClose;
     if (fresh.outOfRangeWaitMinutes != null) m.outOfRangeWaitMinutes = fresh.outOfRangeWaitMinutes;
+    if (fresh.outOfRangeWaitMinutesAbove != null) m.outOfRangeWaitMinutesAbove = fresh.outOfRangeWaitMinutesAbove;
+    if (fresh.outOfRangeWaitMinutesBelow != null) m.outOfRangeWaitMinutesBelow = fresh.outOfRangeWaitMinutesBelow;
     if (fresh.oorCooldownTriggerCount != null) m.oorCooldownTriggerCount = fresh.oorCooldownTriggerCount;
     if (fresh.oorCooldownHours       != null) m.oorCooldownHours       = fresh.oorCooldownHours;
     if (fresh.repeatDeployCooldownEnabled !== undefined) m.repeatDeployCooldownEnabled = fresh.repeatDeployCooldownEnabled;
