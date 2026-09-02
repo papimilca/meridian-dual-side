@@ -592,6 +592,17 @@ export async function notifyClose({ pair, pnlUsd, pnlPct }) {
   );
 }
 
+export async function notifyPartialTp({ pair, pct, pnlPct, swapAmount, swapSymbol, reason }) {
+  if (hasActiveLiveMessage()) return;
+  const sign = pnlPct >= 0 ? "+" : "";
+  await sendHTML(
+    `⚖️ <b>Partial TP</b> ${escapeHtml(pair)}\n` +
+    `Removed ${pct}% of liquidity (peak PnL: ${sign}${(pnlPct ?? 0).toFixed(2)}%) — profit locked, remainder still riding\n` +
+    (swapAmount != null ? `Swapped ~${swapAmount} ${swapSymbol ?? "token"} → SOL\n` : "") +
+    `Reason: ${escapeHtml(reason ?? "peak trigger")}`
+  );
+}
+
 export async function notifyCloseDetailed({
   pair,
   pnlUsd,

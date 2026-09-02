@@ -182,6 +182,14 @@ async function executeManagementActions(actionPositions, actionMap, { liveMessag
       const ok = res?.success !== false && !res?.error && !res?.blocked;
       await liveMessage?.toolFinish("close_position", res, ok);
       lines.push(`${p.pair}: ${ok ? `closed (${reason})` : `close FAILED — ${res?.error || res?.reason || "unknown"}`}`);
+    } else if (act.action === "PARTIAL_CLOSE") {
+      const reason = act.reason || "partial TP";
+      const bps = act.bps ?? 5000;
+      await liveMessage?.toolStart("close_position");
+      const res = await executeTool("close_position", { position_address: p.position, reason, bps }).catch(e => ({ error: e.message }));
+      const ok = res?.success !== false && !res?.error && !res?.blocked;
+      await liveMessage?.toolFinish("close_position", res, ok);
+      lines.push(`${p.pair}: ${ok ? `partial TP — removed ${(bps / 100).toFixed(0)}% of liquidity (${reason})` : `partial TP FAILED — ${res?.error || res?.reason || "unknown"}`}`);
     } else if (act.action === "CLAIM") {
       await liveMessage?.toolStart("claim_fees");
       const res = await executeTool("claim_fees", { position_address: p.position }).catch(e => ({ error: e.message }));
@@ -260,7 +268,7 @@ export async function runManagementCycle({ silent = false } = {}) {
       confirmPeak(p.position, p.pnl_pct, 1);
       const exit = updatePnlAndCheckExits(p.position, p, config.management);
       if (exit) {
-        exitMap.set(p.position, exit.reason);
+        exitMap.set(p.position, exit);
         log("state", `Exit alert for ${p.pair}: ${exit.reason}`);
       }
     }
@@ -271,7 +279,12 @@ export async function runManagementCycle({ silent = false } = {}) {
     for (const p of positionData) {
       // Hard exit — highest priority
       if (exitMap.has(p.position)) {
-        actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitMap.get(p.position) });
+        const exitInfo = exitMap.get(p.position);
+        if (exitInfo.action === "PARTIAL_TP") {
+          actionMap.set(p.position, { action: "PARTIAL_CLOSE", rule: "exit", reason: exitInfo.reason, bps: exitInfo.bps });
+        } else {
+          actionMap.set(p.position, { action: "CLOSE", rule: "exit", reason: exitInfo.reason });
+        }
         continue;
       }
       // Instruction-set — pass to LLM, can't parse in JS
@@ -819,7 +832,10 @@ Summarize the current portfolio health, total fees earned, and performance of al
         // Hold the management lock so the cron cycle can't double-act on this position.
         _managementBusy = true;
         try {
-          const actMap = new Map([[p.position, { action: "CLOSE", rule, reason }]]);
+          const pollAction = signal === "PARTIAL_TP"
+            ? { action: "PARTIAL_CLOSE", rule, reason, bps: exit?.bps }
+            : { action: "CLOSE", rule, reason };
+          const actMap = new Map([[p.position, pollAction]]);
           const rpt = await executeManagementActions([p], actMap, {});
           log("state", `[PnL poll] ${p.pair}: ${rpt || "closed"}`);
         } catch (e) {

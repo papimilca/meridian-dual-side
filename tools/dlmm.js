@@ -19,6 +19,7 @@ import {
   markInRange,
   recordClaim,
   recordClose,
+  markPartialTpTaken,
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
@@ -2431,13 +2432,94 @@ async function fetchClosedPnL({ position_address, poolAddress, pool, wallet, tra
   });
 }
 
-export async function closePosition({ position_address, reason }) {
+/**
+ * Partial close — remove a fraction (bps/10000) of the position's liquidity while
+ * keeping the position NFT open, so trailing TP / other exit rules still guard the
+ * remaining liquidity. Fees are NOT claimed here (they keep accruing and are claimed
+ * at the final close). The withdrawn base token is auto-swapped back to SOL by the
+ * executor (same path as full closes).
+ */
+async function partialRemoveLiquidity({ position_address, reason, bps, tracked }) {
+  const wallet = getWallet();
+  const connection = getConnection();
+  const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
+  const pool = await getPool(poolAddress);
+  const positionPubKey = new PublicKey(position_address);
+
+  // Live bin range for the removal
+  let fromBinId = tracked?.bin_range?.min ?? -887272;
+  let toBinId = tracked?.bin_range?.max ?? 887272;
+  const positionData = await pool.getPosition(positionPubKey);
+  const processed = positionData?.positionData;
+  if (processed) {
+    if (processed.lowerBinId != null) fromBinId = processed.lowerBinId;
+    if (processed.upperBinId != null) toBinId = processed.upperBinId;
+  }
+
+  log("close", `Partial TP: removing ${(bps / 100).toFixed(0)}% of liquidity from ${position_address.slice(0, 8)} (bins ${fromBinId}→${toBinId})`);
+
+  const removeTxs = await pool.removeLiquidity({
+    user: wallet.publicKey,
+    position: positionPubKey,
+    fromBinId,
+    toBinId,
+    bps: new BN(bps),
+    shouldClaimAndClose: false, // keep the position NFT open — remaining liquidity stays managed
+  });
+  const txHashes = [];
+  for (const tx of Array.isArray(removeTxs) ? removeTxs : [removeTxs]) {
+    const txHash = await sendAndConfirmTransaction(connection, tx, [wallet]);
+    txHashes.push(txHash);
+  }
+  log("close", `Partial TP OK: ${txHashes.join(", ")}`);
+
+  // Let RPC index the change before the next positions fetch
+  await new Promise((r) => setTimeout(r, 3000));
+  _positionsCacheAt = 0;
+
+  markPartialTpTaken(position_address);
+
+  appendDecision({
+    type: "partial_close",
+    actor: "MANAGER",
+    pool: poolAddress,
+    pool_name: tracked?.pool_name || poolAddress.slice(0, 8),
+    position: position_address,
+    summary: `Partial TP: removed ${(bps / 100).toFixed(0)}% of liquidity`,
+    reason: reason || "partial TP",
+    metrics: { bps },
+  });
+
+  const baseMint = pool.lbPair.tokenXMint.toString();
+  const poolMeta = await getPoolMetadata(poolAddress).catch(() => null);
+
+  return {
+    success: true,
+    partial: true,
+    bps,
+    position: position_address,
+    pool: poolAddress,
+    pool_name: tracked?.pool_name || poolMeta?.name || null,
+    txs: txHashes,
+    // Only expose base_mint when there is a non-SOL base token to auto-swap
+    base_mint: baseMint !== config.tokens.SOL ? baseMint : null,
+    reason: reason || "partial TP",
+  };
+}
+
+export async function closePosition({ position_address, reason, bps = 10000 }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
   }
 
   const tracked = getTrackedPosition(position_address);
+
+  // ─── Partial close: fraction of liquidity removed, position stays open ───
+  const closeBps = Math.min(10000, Math.max(1, Math.round(Number(bps) || 10000)));
+  if (closeBps < 10000) {
+    return await partialRemoveLiquidity({ position_address, reason, bps: closeBps, tracked });
+  }
 
   try {
     log("close", `Closing position: ${position_address}`);

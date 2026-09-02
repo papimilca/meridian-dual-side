@@ -40,7 +40,7 @@ const TIMEFRAME_MINUTES = {
   "24h": 1440,
 };
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifyCloseDetailed, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifyCloseDetailed, notifyPartialTp, notifySwap } from "../telegram.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -718,6 +718,30 @@ export async function executeTool(name, args) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+      } else if (name === "close_position" && result.partial) {
+        // ── Partial close (partial TP): swap withdrawn base back to SOL + simple notify ──
+        let swapAmountSol = null;
+        let swapSymbol = null;
+        if (!args.skip_swap && result.base_mint && !result.auto_swapped) {
+          const { swapped, result: swapResult, token } = await swapBaseToSolWithRetry(result.base_mint, "after partial TP");
+          if (swapped) {
+            result.auto_swapped = true;
+            result.auto_swap_note = `Withdrawn base token already auto-swapped back to SOL (${result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
+            if (swapResult?.amount_out) {
+              result.sol_received = swapResult.amount_out;
+              swapAmountSol = swapResult.amount_out > 1000 ? swapResult.amount_out / 1e9 : swapResult.amount_out;
+              swapSymbol = token?.symbol || "token";
+            }
+          }
+        }
+        notifyPartialTp({
+          pair: result.pool_name || args.position_address?.slice(0, 8),
+          pct: (result.bps / 100).toFixed(0),
+          pnlPct: result.pnl_pct ?? null,
+          swapAmount: swapAmountSol,
+          swapSymbol,
+          reason: args.reason,
+        }).catch(() => {});
       } else if (name === "close_position") {
         // preClosePos was fetched BEFORE the close ran (see above)
         let preClosePnlUsd = preClosePos?.pnl_usd ?? 0;

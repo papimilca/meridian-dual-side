@@ -276,9 +276,12 @@ WARNING: This executes a real on-chain transaction.`,
     type: "function",
     function: {
       name: "close_position",
-      description: `Remove all liquidity and close a position.
-This withdraws all tokens back to the wallet and closes the position account.
-Use when:
+      description: `Remove liquidity and close a position.
+Full close (default) withdraws all tokens back to the wallet and closes the position account.
+Partial close (bps < 10000) removes only a fraction of the liquidity — the position stays open
+so trailing TP / other exit rules still guard the remainder. Use a partial close for taking
+profit on a strong runner while letting the rest ride.
+Use full close when:
 - Position has been out of range for > 30 minutes
 - IL exceeds accumulated fees
 - Token shows danger signals (organic score drop, volume crash)
@@ -292,13 +295,17 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
             type: "string",
             description: "The position public key to close"
           },
+          bps: {
+            type: "number",
+            description: "Fraction of liquidity to remove, in basis points. 10000 (default) = full close + close the position account; e.g. 5000 = remove 50% and keep the position open."
+          },
           skip_swap: {
             type: "boolean",
             description: "Set to true if user explicitly wants to hold/keep the base token after closing. Default: false (auto-swaps base token back to SOL)."
           },
           reason: {
             type: "string",
-            description: "Why this position is being closed. Include the rule that triggered it, e.g. 'low yield', 'stop loss', 'trailing TP', 'OOR'. Used for pool memory."
+            description: "Why this position is being closed. Include the rule that triggered it, e.g. 'low yield', 'stop loss', 'trailing TP', 'OOR', 'partial TP'. Used for pool memory."
           }
         },
         required: ["position_address"]

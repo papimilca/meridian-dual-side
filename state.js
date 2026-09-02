@@ -112,6 +112,7 @@ export function trackPosition({
     pending_exit_count: 0,
     pending_exit_started_at: null,
     trailing_active: false,
+    partial_tp_taken: false,
   };
   pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
   save(state);
@@ -261,6 +262,19 @@ export function confirmPeak(position_address, candidatePnlPct, confirmTicks = 2)
 }
 
 /**
+ * Mark that a partial take-profit has been executed for this position so it
+ * won't fire again. The remaining liquidity stays open under trailing TP.
+ */
+export function markPartialTpTaken(position_address) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return;
+  pos.partial_tp_taken = true;
+  save(state);
+  log("state", `Position ${position_address} partial TP marked as taken`);
+}
+
+/**
  * Consecutive-tick confirmation for an exit signal. The fast poller calls this every
  * tick with the exit action string detected this poll (or null when no exit). An exit
  * only fires after `confirmTicks` consecutive polls report the SAME action — so a single
@@ -390,6 +404,25 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     return {
       action: "STOP_LOSS",
       reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,
+    };
+  }
+
+  // ── Partial take-profit (lock profit, let the rest ride) ──────
+  // Fires once when the confirmed peak reaches the trigger — BEFORE the
+  // trailing check so a fast pump locks profit even if it reverses instantly.
+  if (
+    !pnl_pct_suspicious &&
+    mgmtConfig.partialTakeProfit &&
+    !pos.partial_tp_taken &&
+    (pos.peak_pnl_pct ?? 0) >= (mgmtConfig.partialTpTriggerPct ?? 6)
+  ) {
+    const closePct = Math.min(100, Math.max(1, mgmtConfig.partialTpClosePct ?? 50));
+    return {
+      action: "PARTIAL_TP",
+      reason: `Partial TP: peak ${pos.peak_pnl_pct.toFixed(2)}% >= ${mgmtConfig.partialTpTriggerPct}% — removing ${closePct}% of liquidity`,
+      needs_confirmation: true,
+      bps: Math.round(closePct * 100),
+      peak_pnl_pct: pos.peak_pnl_pct,
     };
   }
 

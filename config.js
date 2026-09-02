@@ -164,6 +164,12 @@ export const config = {
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
+    // Partial take-profit — remove a percentage of liquidity to lock profit while
+    // letting the rest ride under trailing TP. Fires once when peak PnL reaches
+    // the trigger threshold; trailing TP still handles the full exit on reversal.
+    partialTakeProfit:     u.partialTakeProfit     ?? false,
+    partialTpTriggerPct:   u.partialTpTriggerPct   ?? 6,    // trigger partial close when confirmed peak >= X%
+    partialTpClosePct:     u.partialTpClosePct     ?? 50,   // percentage of remaining liquidity to remove (1-100)
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
     // Zap-out fast close: uses @meteora-ag/zap-sdk to remove liquidity + swap base→SOL
@@ -416,6 +422,9 @@ export function reloadScreeningThresholds() {
     if (fresh.trailingTakeProfit    !== undefined) m.trailingTakeProfit    = fresh.trailingTakeProfit;
     if (fresh.trailingTriggerPct    != null) m.trailingTriggerPct    = fresh.trailingTriggerPct;
     if (fresh.trailingDropPct       != null) m.trailingDropPct       = fresh.trailingDropPct;
+    if (fresh.partialTakeProfit     !== undefined) m.partialTakeProfit     = fresh.partialTakeProfit;
+    if (fresh.partialTpTriggerPct   != null) m.partialTpTriggerPct   = fresh.partialTpTriggerPct;
+    if (fresh.partialTpClosePct     != null) m.partialTpClosePct     = fresh.partialTpClosePct;
     if (fresh.pnlSanityMaxDiffPct   != null) m.pnlSanityMaxDiffPct   = fresh.pnlSanityMaxDiffPct;
     if (fresh.solMode               !== undefined) m.solMode               = fresh.solMode;
     const minBinsBelow = numericConfig(fresh.minBinsBelow) ?? config.strategy.minBinsBelow;
