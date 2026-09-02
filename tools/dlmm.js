@@ -1982,16 +1982,33 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
   }
   log("close", `Zap-out: liquidity removed in ${txHashes.length} tx(s): ${txHashes.join(", ")}`);
 
+  // ── Read actual withdrawn delta AFTER remove confirms ──────────
+  // postBalance − preBalance = withdrawn liquidity + claimed fees in token X.
+  // Using the real delta for the quote and maxSwapAmount makes the zap cover
+  // fees too, so the manual fallback swap is rarely needed.
+  let zapSwapAmount = totalAmountX;
+  if (needsZapSwap) {
+    try {
+      const postBalance = new BN(await getTokenAccountBalance(connection, zapInputAta));
+      const delta = postBalance.sub(zapPreBalance);
+      if (delta.gte(new BN(0))) {
+        zapSwapAmount = delta;
+        log("close", `Zap-out: post-removal balance delta: ${delta.toString()} lamports (liquidity + fees)`);
+      }
+    } catch {
+      // RPC read failed — keep the liquidity-only estimate; fallback covers the rest
+    }
+  }
+
   // ── Step 2: Build zap-out tx (Jupiter swap via Zap program) ────
   // If we got base token (X) out, swap it → SOL via Jupiter through the Zap
   // program so the ledger tracks it.  If we only got quote token (Y) and it's
   // already SOL, skip the swap — no zap needed.
-  const hasBaseToken = totalAmountX.gt(new BN(0));
   let zapTxHash = null;
   let swappedToMint = null;
 
-  if (hasBaseToken && !tokenXMint.equals(SOL_MINT)) {
-    log("close", `Zap-out: swapping withdrawn base token (${totalAmountX.toString()} lamports) → SOL via Jupiter`);
+  if (needsZapSwap && zapSwapAmount.gt(new BN(0))) {
+    log("close", `Zap-out: swapping withdrawn base token (${zapSwapAmount.toString()} lamports) → SOL via Jupiter`);
 
     const zapClient = new Zap(connection, {
       jupiterApiUrl: getJupiterApiUrl(),
@@ -2005,7 +2022,7 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
     const quoteResponse = await getJupiterQuote(
       tokenXMint,           // input mint (base token)
       SOL_MINT,             // output mint (SOL)
-      totalAmountX,         // amount in (lamports)
+      zapSwapAmount,        // amount in (lamports) — actual delta incl. fees
       maxAccounts,          // max accounts
       slippageBps,          // slippage bps
       false,                // dynamic slippage
@@ -2053,9 +2070,12 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
     const unwrapIx = unwrapSOLInstruction(wallet.publicKey, wallet.publicKey);
     if (unwrapIx) zapPostInstructions.push(unwrapIx); // output is wSOL → unwrap to native SOL
 
-    // Cap covers pre-existing dust + withdrawn liquidity (claimed fees beyond
-    // this cap are picked up by the manual fallback swap below).
-    const maxSwapAmount = zapPreBalance.add(totalAmountX);
+    // Cap covers the actual delta (liquidity + fees).  Anything beyond this
+    // (e.g. balance changed between read and execution) falls through to the
+    // manual fallback swap below.
+    const maxSwapAmount = zapSwapAmount.gt(zapPreBalance.add(totalAmountX))
+      ? zapSwapAmount
+      : zapPreBalance.add(totalAmountX);
 
     const zapOutTx = await zapClient.zapOut({
       userTokenInAccount: zapInputAta,
@@ -2243,7 +2263,7 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
     }
 
     // Record performance + decision log (non-blocking)
-    fetchClosedPnL({ position_address, poolAddress, pool, tracked, poolMeta, reason, txHashes, swappedToMint })
+    fetchClosedPnL({ position_address, poolAddress, pool, wallet, tracked, poolMeta, reason, txHashes, swappedToMint, fallbackPnl: { pnlUsd, pnlPct, pnlTrueUsd, pnlSol, initialUsd, finalValueUsd, feesUsd } })
       .catch((e) => log("close_warn", `Zap-out PnL background record failed: ${e.message}`));
   }
 
@@ -2278,7 +2298,7 @@ async function closePositionWithZapOut({ position_address, reason, poolAddress, 
  * Fetch closed PnL from Meteora API in the background.
  * Non-blocking — runs after closePosition returns so the bot can proceed.
  */
-async function fetchClosedPnL({ position_address, poolAddress, pool, wallet, tracked, poolMeta, reason, txHashes, swappedToMint }) {
+async function fetchClosedPnL({ position_address, poolAddress, pool, wallet, tracked, poolMeta, reason, txHashes, swappedToMint, fallbackPnl }) {
   if (!tracked) {
     appendDecision({
       type: "close",
@@ -2332,6 +2352,19 @@ async function fetchClosedPnL({ position_address, poolAddress, pool, wallet, tra
     }
   } catch (e) {
     log("close_warn", `Zap-out closed PnL fetch failed: ${e.message}`);
+  }
+
+  // Fallback to PnL already fetched by closePositionWithZapOut (bounded loop)
+  // so performance records never store zeros when the re-fetch fails.
+  if (initialUsd === 0 && fallbackPnl && (fallbackPnl.initialUsd > 0 || fallbackPnl.finalValueUsd > 0)) {
+    pnlUsd      = fallbackPnl.pnlUsd ?? 0;
+    pnlTrueUsd  = fallbackPnl.pnlTrueUsd ?? 0;
+    pnlSol      = fallbackPnl.pnlSol ?? 0;
+    pnlPct      = fallbackPnl.pnlPct ?? 0;
+    finalValueUsd = fallbackPnl.finalValueUsd ?? 0;
+    initialUsd  = fallbackPnl.initialUsd ?? 0;
+    feesUsd     = fallbackPnl.feesUsd || feesUsd;
+    log("close", `Zap-out closed PnL (fallback from close fetch): ${pnlUsd.toFixed(2)} USD (${pnlPct.toFixed(2)}%)`);
   }
 
   const closeBaseMint = pool.lbPair.tokenXMint.toString();
