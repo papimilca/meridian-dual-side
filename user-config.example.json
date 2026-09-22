@@ -97,7 +97,7 @@
   "lpAgentRelayEnabled": false,
 
   "pnlSource": "rpc",
-  "pnlRpcUrl": "https://solana-rpc.publicnode.com",
+  "pnlRpcUrl": "https://api.mainnet-beta.solana.com",
   "pnlPollIntervalSec": 3,
   "pnlDepositCacheTtlSec": 300,
 

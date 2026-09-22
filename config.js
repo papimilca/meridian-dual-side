@@ -241,10 +241,11 @@ export const config = {
   // ─── PnL fetcher / poller (public infra: RPC + Meteora deposits + Jupiter) ──
   pnl: {
     // Live position value comes from on-chain reads on this RPC.
-    // Defaults to a free public RPC (publicnode) so the aggressive poller
-    // never burns the main RPC_URL or the LPAgent sponsor budget.
-    // pump.helius-rpc.com is dead (403) since 2026.
-    rpcUrl: nonEmptyString(u.pnlRpcUrl, process.env.PNL_RPC_URL, "https://solana-rpc.publicnode.com"),
+    // Defaults to the official public RPC (allows indexed requests needed by
+    // getAllLbPairPositionsByUser / getSignaturesForAddress) so the aggressive
+    // poller never burns the main RPC_URL or the LPAgent sponsor budget.
+    // publicnode/onfinality block indexed requests on free tier.
+    rpcUrl: nonEmptyString(u.pnlRpcUrl, process.env.PNL_RPC_URL, "https://api.mainnet-beta.solana.com"),
     source: nonEmptyString(u.pnlSource, "rpc"), // rpc | meteora (fallback-only)
     pollIntervalSec: Number(u.pnlPollIntervalSec ?? 3),
     depositCacheTtlSec: Number(u.pnlDepositCacheTtlSec ?? 300),
