@@ -97,7 +97,7 @@
   "lpAgentRelayEnabled": false,
 
   "pnlSource": "rpc",
-  "pnlRpcUrl": "https://pump.helius-rpc.com",
+  "pnlRpcUrl": "https://solana-rpc.publicnode.com",
   "pnlPollIntervalSec": 3,
   "pnlDepositCacheTtlSec": 300,
 
@@ -115,7 +115,12 @@
     "candles": 298,
     "rsiOversold": 30,
     "rsiOverbought": 80,
-    "requireAllIntervals": false
+    "requireAllIntervals": false,
+    "strictMode": true,
+    "minCandles": 50,
+    "maxCandleAgeIntervals": 3,
+    "maxSpikePct": 20,
+    "maxEntryRsi": 95
   },
   "telegramChatId": "",
   "hiveMindUrl": "",

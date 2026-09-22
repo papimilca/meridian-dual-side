@@ -241,9 +241,10 @@ export const config = {
   // ─── PnL fetcher / poller (public infra: RPC + Meteora deposits + Jupiter) ──
   pnl: {
     // Live position value comes from on-chain reads on this RPC.
-    // Defaults to the public pump.helius endpoint so the aggressive poller
+    // Defaults to a free public RPC (publicnode) so the aggressive poller
     // never burns the main RPC_URL or the LPAgent sponsor budget.
-    rpcUrl: nonEmptyString(u.pnlRpcUrl, process.env.PNL_RPC_URL, "https://pump.helius-rpc.com"),
+    // pump.helius-rpc.com is dead (403) since 2026.
+    rpcUrl: nonEmptyString(u.pnlRpcUrl, process.env.PNL_RPC_URL, "https://solana-rpc.publicnode.com"),
     source: nonEmptyString(u.pnlSource, "rpc"), // rpc | meteora (fallback-only)
     pollIntervalSec: Number(u.pnlPollIntervalSec ?? 3),
     depositCacheTtlSec: Number(u.pnlDepositCacheTtlSec ?? 300),
@@ -308,6 +309,11 @@ export const config = {
     rsiOversold: indicatorUserConfig.rsiOversold ?? 30,
     rsiOverbought: indicatorUserConfig.rsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
+    strictMode: indicatorUserConfig.strictMode ?? true,
+    minCandles: indicatorUserConfig.minCandles ?? 50,
+    maxCandleAgeIntervals: indicatorUserConfig.maxCandleAgeIntervals ?? 3,
+    maxSpikePct: indicatorUserConfig.maxSpikePct ?? 20,
+    maxEntryRsi: indicatorUserConfig.maxEntryRsi ?? 95,
   },
 };
 

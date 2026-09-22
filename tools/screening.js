@@ -745,16 +745,18 @@ export async function getTopCandidates({ limit = 10 } = {}) {
           const confirmation = await confirmIndicatorPreset({
             mint: pool.base?.mint,
             side: "entry",
+            pool: pool.pool,
           });
           return { pool: pool.pool, confirmation };
         } catch (error) {
+          const strict = !!config.indicators.strictMode;
           return {
             pool: pool.pool,
             confirmation: {
               enabled: true,
-              confirmed: true,
+              confirmed: !strict,
               skipped: true,
-              reason: `Indicator confirmation unavailable: ${error.message}`,
+              reason: `Indicator confirmation unavailable: ${error.message}${strict ? " — entry blocked (strictMode)" : ""}`,
               intervals: [],
             },
           };

@@ -1,4 +1,5 @@
 import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
+import { confirmIndicatorPreset } from "./chart-indicators.js";
 import {
   getActiveBin,
   deployPosition,
@@ -194,7 +195,7 @@ async function validateDeployPoolThresholds(args) {
     entry_holders: numberOrNull(detail?.base_token_holders ?? detail?.token_x?.holders),
   };
 
-  return { pass: true, entryMarketData };
+  return { pass: true, entryMarketData, baseMint };
 }
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
@@ -861,6 +862,42 @@ async function runSafetyChecks(name, args) {
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
+
+      // Re-verify the indicator entry signal right before deploy so we never
+      // enter while the signal is gone, the indicators are not yet formed,
+      // or price is spiking (ATH). This closes the gap between screening
+      // time and execution time.
+      if (config.indicators.enabled) {
+        const baseMint = args.base_mint || poolThresholds.baseMint;
+        if (!baseMint) {
+          return {
+            pass: false,
+            reason: "Could not determine base mint for the indicator entry re-check. Refusing deploy.",
+          };
+        }
+        try {
+          const confirmation = await confirmIndicatorPreset({
+            mint: baseMint,
+            side: "entry",
+            refresh: true,
+            pool: args.pool_address || null,
+          });
+          if (confirmation.enabled && !confirmation.confirmed) {
+            return {
+              pass: false,
+              reason: `Indicator entry signal not confirmed at deploy time: ${confirmation.reason}`,
+            };
+          }
+        } catch (error) {
+          if (config.indicators.strictMode) {
+            return {
+              pass: false,
+              reason: `Indicator entry re-check failed: ${error.message} — deploy blocked (strictMode).`,
+            };
+          }
+          log("indicators_warn", `Deploy-time indicator re-check failed, continuing (strictMode off): ${error.message}`);
+        }
+      }
 
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;
