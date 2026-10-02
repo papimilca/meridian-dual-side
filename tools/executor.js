@@ -1,5 +1,5 @@
 import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
-import { confirmIndicatorPreset } from "./chart-indicators.js";
+import { confirmIndicatorPreset, checkOneMinuteVolume } from "./chart-indicators.js";
 import {
   getActiveBin,
   deployPosition,
@@ -862,6 +862,33 @@ async function runSafetyChecks(name, args) {
       const poolThresholds = await validateDeployPoolThresholds(args);
       if (!poolThresholds.pass) return poolThresholds;
       if (poolThresholds.entryMarketData) Object.assign(args, poolThresholds.entryMarketData);
+
+      // Hard gate on 1-minute USD volume: refuse to deploy into tokens whose
+      // recent per-minute trading volume is too low (illiquid for fast in/out).
+      const minVolume1mUsd = Number(config.indicators.minVolume1mUsd ?? 0);
+      if (minVolume1mUsd > 0) {
+        const volMint = args.base_mint || poolThresholds.baseMint;
+        try {
+          const volumeCheck = await checkOneMinuteVolume({
+            mint: volMint,
+            poolAddress: args.pool_address || null,
+          });
+          if (volumeCheck.enabled && !volumeCheck.ok) {
+            return {
+              pass: false,
+              reason: `1-minute volume gate: ${volumeCheck.reason}`,
+            };
+          }
+        } catch (error) {
+          if (config.indicators.strictMode) {
+            return {
+              pass: false,
+              reason: `1-minute volume check failed: ${error.message} — deploy blocked (strictMode).`,
+            };
+          }
+          log("indicators_warn", `Deploy-time 1m volume check failed, continuing (strictMode off): ${error.message}`);
+        }
+      }
 
       // Re-verify the indicator entry signal right before deploy so we never
       // enter while the signal is gone, the indicators are not yet formed,

@@ -120,7 +120,8 @@
     "minCandles": 50,
     "maxCandleAgeIntervals": 3,
     "maxSpikePct": 20,
-    "maxEntryRsi": 95
+    "maxEntryRsi": 95,
+    "minVolume1mUsd": 30000
   },
   "telegramChatId": "",
   "hiveMindUrl": "",

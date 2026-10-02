@@ -289,6 +289,98 @@ async function fetchLocalOneMinutePayload(mint, poolAddress) {
   return buildLocalIndicatorPayload(candles, config.indicators.rsiLength ?? 2);
 }
 
+/**
+ * Hard gate on 1-minute USD volume (mirrors the GMGN "vol 1m" reference).
+ * Fetches the most recent 1m candles from GeckoTerminal (currency=usd → the
+ * volume field is already USD-denominated, no price multiplication needed)
+ * and requires BOTH the last completed candle AND the average of the last 3
+ * completed candles to be >= config.indicators.minVolume1mUsd.
+ * The in-progress (partial) candle is excluded so a deploy early in a minute
+ * is not falsely rejected.
+ *
+ * Note: GeckoTerminal only emits candles for minutes that had trades. To stay
+ * faithful to "vol 1m", the most recent completed candle must also be fresh
+ * (≤ 2 minutes old) — otherwise the token has simply gone quiet and the
+ * stale candle's volume no longer reflects the current minute.
+ */
+export async function checkOneMinuteVolume({ mint, poolAddress } = {}) {
+  const minVolume1mUsd = Number(config.indicators.minVolume1mUsd ?? 0);
+  if (!(minVolume1mUsd > 0)) {
+    return { enabled: false, ok: true, reason: "1m volume gate disabled" };
+  }
+
+  let resolvedPool = poolAddress || null;
+  if (!resolvedPool) {
+    if (!mint) {
+      return { enabled: true, ok: false, reason: "no mint or pool address to check 1m volume" };
+    }
+    resolvedPool = await resolvePoolAddressByMint(mint);
+  }
+
+  const url = `${GECKO_TERMINAL_BASE}/networks/solana/pools/${resolvedPool}/ohlcv/minute?aggregate=1&currency=usd&limit=5`;
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!res.ok) throw new Error(`GeckoTerminal OHLCV failed (${res.status})`);
+  const payload = await res.json();
+  // ohlcv_list is newest-first: [time, open, high, low, close, volume]
+  let list = payload?.data?.attributes?.ohlcv_list || [];
+  const nowSec = Date.now() / 1000;
+  // Drop the in-progress candle (timestamp within the current minute)
+  if (list.length > 0 && Number(list[0][0]) + 60 > nowSec) list = list.slice(1);
+
+  if (list.length === 0) {
+    return {
+      enabled: true,
+      ok: false,
+      lastVolumeUsd: 0,
+      avg3VolumeUsd: 0,
+      minVolume1mUsd,
+      reason: `no completed 1-minute candles — no recent trades (needs >= $${minVolume1mUsd.toLocaleString("en-US")}/min)`,
+    };
+  }
+
+  // Staleness guard: the newest completed candle must be recent
+  const lastCandleAgeSec = nowSec - Number(list[0][0]);
+  if (lastCandleAgeSec > 120) {
+    return {
+      enabled: true,
+      ok: false,
+      lastVolumeUsd: 0,
+      avg3VolumeUsd: 0,
+      minVolume1mUsd,
+      reason: `no trades in the last ${Math.round(lastCandleAgeSec / 60)} minutes — too quiet for fast in/out (needs >= $${minVolume1mUsd.toLocaleString("en-US")}/min)`,
+    };
+  }
+
+  // With currency=usd the volume field is already in USD
+  const volumesUsd = list
+    .slice(0, 3)
+    .map(([, , , , , volume]) => Number(volume))
+    .filter((v) => Number.isFinite(v) && v >= 0);
+
+  if (volumesUsd.length === 0) {
+    return {
+      enabled: true,
+      ok: false,
+      reason: "no completed 1-minute candles with volume data available",
+      minVolume1mUsd,
+    };
+  }
+
+  const lastVolumeUsd = volumesUsd[0];
+  const avg3VolumeUsd = volumesUsd.reduce((a, b) => a + b, 0) / volumesUsd.length;
+  const ok = lastVolumeUsd >= minVolume1mUsd && avg3VolumeUsd >= minVolume1mUsd;
+  return {
+    enabled: true,
+    ok,
+    lastVolumeUsd,
+    avg3VolumeUsd,
+    minVolume1mUsd,
+    reason: ok
+      ? `1m volume OK: last $${Math.round(lastVolumeUsd).toLocaleString("en-US")}, avg3 $${Math.round(avg3VolumeUsd).toLocaleString("en-US")} >= $${minVolume1mUsd.toLocaleString("en-US")}`
+      : `1m volume too low: last $${Math.round(lastVolumeUsd).toLocaleString("en-US")}, avg3 $${Math.round(avg3VolumeUsd).toLocaleString("en-US")} — both must be >= $${minVolume1mUsd.toLocaleString("en-US")} (token is too illiquid for fast in/out)`,
+  };
+}
+
 function buildSignalSummary(payload) {
   const latest = payload?.latest || {};
   const candle = latest?.candle || {};
