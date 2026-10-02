@@ -122,7 +122,8 @@
     "maxSpikePct": 20,
     "maxEntryRsi": 95,
     "minVolume1mUsd": 30000,
-    "volume1mScope": "token"
+    "volume1mScope": "token",
+    "birdeyeApiKey": ""
   },
   "telegramChatId": "",
   "hiveMindUrl": "",

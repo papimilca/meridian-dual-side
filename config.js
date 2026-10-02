@@ -322,6 +322,9 @@ export const config = {
     // Where the 1m volume is measured: "token" = GMGN-style token-wide across
     // all markets; "pool" = only the deploy pool itself.
     volume1mScope: indicatorUserConfig.volume1mScope ?? "token",
+    // Optional Birdeye API key — used as OHLCV fallback when GeckoTerminal
+    // is rate-limited (429) or unavailable. Free tier works for 1m candles.
+    birdeyeApiKey: indicatorUserConfig.birdeyeApiKey ?? process.env.BIRDEYE_API_KEY ?? "",
   },
 };
 

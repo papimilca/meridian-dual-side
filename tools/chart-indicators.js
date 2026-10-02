@@ -13,6 +13,7 @@ const LOCAL_SUPERTREND_PERIOD = 10;
 const LOCAL_SUPERTREND_MULTIPLIER = 3;
 const LOCAL_FIB_LOOKBACK = 100;
 const GECKO_TERMINAL_BASE = "https://api.geckoterminal.com/api/v2";
+const BIRDEYE_API_BASE = "https://public-api.birdeye.so";
 
 const INTERVAL_MS = {
   "1_MINUTE": 60 * 1000,
@@ -153,6 +154,43 @@ async function fetchOneMinuteCandles(poolAddress, limit) {
     .reverse();
 }
 
+/**
+ * Birdeye OHLCV fallback (token mint, 1m, USD-denominated). Used when the
+ * public GeckoTerminal endpoint is rate-limited (429) or unavailable so that
+ * strictMode does not block entries on a transient upstream failure.
+ */
+async function fetchBirdeyeOneMinuteCandles(mint, limit) {
+  const apiKey = config.indicators.birdeyeApiKey;
+  if (!apiKey) throw new Error("Birdeye fallback not configured (indicators.birdeyeApiKey missing)");
+  if (!mint) throw new Error("Birdeye fallback needs a mint address");
+  const capped = Math.min(Math.max(Number(limit) || DEFAULT_CANDLES, 10), 1000);
+  const timeTo = Math.floor(Date.now() / 1000);
+  const timeFrom = timeTo - capped * 60;
+  const url = `${BIRDEYE_API_BASE}/defi/ohlcv?address=${mint}&type=1m&time_from=${timeFrom}&time_to=${timeTo}`;
+  const res = await fetch(url, { headers: { "X-API-KEY": apiKey, "x-chain": "solana", Accept: "application/json" } });
+  if (!res.ok) throw new Error(`Birdeye OHLCV failed (${res.status})`);
+  const items = (await res.json())?.data?.items || [];
+  // Birdeye returns oldest-first; v is USD volume. Same candle shape as GeckoTerminal.
+  return items
+    .map((c) => ({ time: c.unixTime, open: c.o, high: c.h, low: c.l, close: c.c, volume: c.v }))
+    .filter((c) => Number.isFinite(Number(c.close)) && Number(c.close) > 0);
+}
+
+/** GeckoTerminal candles with Birdeye fallback; both failing throws a combined error. */
+async function fetchOneMinuteCandlesWithFallback(mint, poolAddress, limit) {
+  try {
+    return await fetchOneMinuteCandles(poolAddress, limit);
+  } catch (error) {
+    try {
+      const candles = await fetchBirdeyeOneMinuteCandles(mint, limit);
+      log("indicators_warn", `GeckoTerminal OHLCV failed (${error.message}) — using Birdeye fallback (${candles.length} candles)`);
+      return candles;
+    } catch (fallbackError) {
+      throw new Error(`${error.message}; Birdeye fallback failed: ${fallbackError.message}`);
+    }
+  }
+}
+
 function computeRsiSeries(closes, length) {
   const rsi = new Array(closes.length).fill(null);
   if (closes.length <= length || length < 1) return rsi;
@@ -282,7 +320,8 @@ function buildLocalIndicatorPayload(candles, rsiLength) {
 async function fetchLocalOneMinutePayload(mint, poolAddress) {
   let resolvedPool = poolAddress || null;
   if (!resolvedPool) resolvedPool = await resolvePoolAddressByMint(mint);
-  const candles = await fetchOneMinuteCandles(
+  const candles = await fetchOneMinuteCandlesWithFallback(
+    mint,
     resolvedPool,
     config.indicators.candles ?? DEFAULT_CANDLES,
   );
@@ -318,29 +357,47 @@ export async function checkOneMinuteVolume({ mint, poolAddress, scope } = {}) {
     if (!mint) {
       return { enabled: true, ok: false, reason: "token-scope 1m volume check needs a mint address" };
     }
-    const pools = await fetchGtPoolsForMint(mint);
-    const top = pools.sort((a, b) => b.volumeH24Usd - a.volumeH24Usd).slice(0, 5);
-    if (top.length === 0) {
-      return {
-        enabled: true,
-        ok: false,
-        scope: "token",
-        lastVolumeUsd: 0,
-        avg3VolumeUsd: 0,
-        minVolume1mUsd,
-        reason: "no pools found for this token — cannot verify 1m volume",
-      };
-    }
-    const results = await Promise.allSettled(top.map((p) => fetchOneMinuteVolumeRows(p.address, 5)));
-    const volumesByMinute = new Map();
-    for (const entry of results) {
-      if (entry.status !== "fulfilled") continue;
-      for (const [timeSec, volumeUsd] of entry.value) {
-        if (!Number.isFinite(volumeUsd) || volumeUsd < 0) continue;
-        volumesByMinute.set(timeSec, (volumesByMinute.get(timeSec) || 0) + volumeUsd);
+    let volumesByMinute = null;
+    try {
+      const pools = await fetchGtPoolsForMint(mint);
+      const top = pools.sort((a, b) => b.volumeH24Usd - a.volumeH24Usd).slice(0, 5);
+      if (top.length === 0) {
+        return {
+          enabled: true,
+          ok: false,
+          scope: "token",
+          lastVolumeUsd: 0,
+          avg3VolumeUsd: 0,
+          minVolume1mUsd,
+          reason: "no pools found for this token — cannot verify 1m volume",
+        };
       }
+      const results = await Promise.allSettled(top.map((p) => fetchOneMinuteVolumeRows(p.address, 5)));
+      volumesByMinute = new Map();
+      for (const entry of results) {
+        if (entry.status !== "fulfilled") continue;
+        for (const [timeSec, volumeUsd] of entry.value) {
+          if (!Number.isFinite(volumeUsd) || volumeUsd < 0) continue;
+          volumesByMinute.set(timeSec, (volumesByMinute.get(timeSec) || 0) + volumeUsd);
+        }
+      }
+      // All pool fetches failed (e.g. GeckoTerminal 429) — fall back to Birdeye.
+      if (results.every((entry) => entry.status === "rejected")) {
+        volumesByMinute = null;
+      } else {
+        return evaluateOneMinuteVolumeGate(volumesByMinute, minVolume1mUsd, "token", top.length);
+      }
+    } catch (error) {
+      log("indicators_warn", `GeckoTerminal token pools lookup failed (${error.message}) — trying Birdeye fallback`);
     }
-    return evaluateOneMinuteVolumeGate(volumesByMinute, minVolume1mUsd, "token", top.length);
+    // Birdeye is token-level, so its 1m USD volume already covers all markets.
+    const candles = await fetchBirdeyeOneMinuteCandles(mint, 5);
+    volumesByMinute = new Map(
+      candles
+        .map((c) => [Number(c.time), Number(c.volume)])
+        .filter(([time, volume]) => Number.isFinite(time) && Number.isFinite(volume) && volume >= 0),
+    );
+    return evaluateOneMinuteVolumeGate(volumesByMinute, minVolume1mUsd, "token", 1);
   }
 
   // Pool scope: only the deploy pool's own candles
@@ -351,7 +408,14 @@ export async function checkOneMinuteVolume({ mint, poolAddress, scope } = {}) {
     }
     resolvedPool = await resolvePoolAddressByMint(mint);
   }
-  const rows = await fetchOneMinuteVolumeRows(resolvedPool, 5);
+  let rows;
+  try {
+    rows = await fetchOneMinuteVolumeRows(resolvedPool, 5);
+  } catch (error) {
+    log("indicators_warn", `GeckoTerminal OHLCV failed (${error.message}) — using Birdeye fallback for 1m volume`);
+    const candles = await fetchBirdeyeOneMinuteCandles(mint, 5);
+    rows = candles.map((c) => [Number(c.time), Number(c.volume)]);
+  }
   const volumesByMinute = new Map(rows.map(([timeSec, volumeUsd]) => [timeSec, volumeUsd]));
   return evaluateOneMinuteVolumeGate(volumesByMinute, minVolume1mUsd, "pool", 1);
 }
