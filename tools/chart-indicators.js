@@ -158,31 +158,76 @@ async function fetchOneMinuteCandles(poolAddress, limit) {
  * Birdeye OHLCV fallback (token mint, 1m, USD-denominated). Used when the
  * public GeckoTerminal endpoint is rate-limited (429) or unavailable so that
  * strictMode does not block entries on a transient upstream failure.
+ *
+ * Free-tier Birdeye is limited to 1 request/second, so calls are serialized
+ * with a >=1.1s gap and successful responses are cached briefly (a deploy
+ * re-check needs candles for both the indicator payload and the 1m volume
+ * gate — one fetch serves both).
  */
+const BIRDEYE_MIN_CALL_GAP_MS = 1100;
+const CANDLE_CACHE_TTL_MS = 45 * 1000;
+const candleCache = new Map(); // cacheKey -> { rows, fetchedAt }
+let _birdeyeChain = Promise.resolve();
+let _birdeyeLastCall = 0;
+
+async function birdeyeFetch(url) {
+  // Serialize: wait for the previous call and enforce the minimum gap.
+  const run = _birdeyeChain.then(async () => {
+    const wait = _birdeyeLastCall + BIRDEYE_MIN_CALL_GAP_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    _birdeyeLastCall = Date.now();
+    const apiKey = config.indicators.birdeyeApiKey;
+    return fetch(url, { headers: { "X-API-KEY": apiKey, "x-chain": "solana", Accept: "application/json" } });
+  });
+  // Keep the chain alive even if a call fails.
+  _birdeyeChain = run.then(() => {}, () => {});
+  return run;
+}
+
 async function fetchBirdeyeOneMinuteCandles(mint, limit) {
-  const apiKey = config.indicators.birdeyeApiKey;
-  if (!apiKey) throw new Error("Birdeye fallback not configured (indicators.birdeyeApiKey missing)");
+  if (!config.indicators.birdeyeApiKey) throw new Error("Birdeye fallback not configured (indicators.birdeyeApiKey missing)");
   if (!mint) throw new Error("Birdeye fallback needs a mint address");
   const capped = Math.min(Math.max(Number(limit) || DEFAULT_CANDLES, 10), 1000);
+  const cacheKey = `birdeye:1m:${mint}:${capped}`;
+  const hit = candleCache.get(cacheKey);
+  if (hit && Date.now() - hit.fetchedAt < CANDLE_CACHE_TTL_MS) return hit.rows;
   const timeTo = Math.floor(Date.now() / 1000);
   const timeFrom = timeTo - capped * 60;
   const url = `${BIRDEYE_API_BASE}/defi/ohlcv?address=${mint}&type=1m&time_from=${timeFrom}&time_to=${timeTo}`;
-  const res = await fetch(url, { headers: { "X-API-KEY": apiKey, "x-chain": "solana", Accept: "application/json" } });
-  if (!res.ok) throw new Error(`Birdeye OHLCV failed (${res.status})`);
-  const items = (await res.json())?.data?.items || [];
+  const res = await birdeyeFetch(url);
+  if (!res.ok) {
+    let detail = "";
+    try {
+      detail = (await res.json())?.message || "";
+    } catch {}
+    throw new Error(`Birdeye OHLCV failed (${res.status}${detail ? `: ${detail}` : ""})`);
+  }
+  const payload = await res.json();
+  if (payload?.success === false) {
+    throw new Error(`Birdeye OHLCV failed: ${payload?.message || "unknown error"}`);
+  }
+  const items = payload?.data?.items || [];
   // Birdeye returns oldest-first; v is USD volume. Same candle shape as GeckoTerminal.
-  return items
+  const rows = items
     .map((c) => ({ time: c.unixTime, open: c.o, high: c.h, low: c.l, close: c.c, volume: c.v }))
     .filter((c) => Number.isFinite(Number(c.close)) && Number(c.close) > 0);
+  candleCache.set(cacheKey, { rows, fetchedAt: Date.now() });
+  return rows;
 }
 
 /** GeckoTerminal candles with Birdeye fallback; both failing throws a combined error. */
 async function fetchOneMinuteCandlesWithFallback(mint, poolAddress, limit) {
+  const capped = Math.min(Math.max(Number(limit) || DEFAULT_CANDLES, 10), 1000);
+  const cacheKey = `gt:1m:token:${poolAddress}:${capped}`;
+  const hit = candleCache.get(cacheKey);
+  if (hit && Date.now() - hit.fetchedAt < CANDLE_CACHE_TTL_MS) return hit.rows;
   try {
-    return await fetchOneMinuteCandles(poolAddress, limit);
+    const candles = await fetchOneMinuteCandles(poolAddress, capped);
+    candleCache.set(cacheKey, { rows: candles, fetchedAt: Date.now() });
+    return candles;
   } catch (error) {
     try {
-      const candles = await fetchBirdeyeOneMinuteCandles(mint, limit);
+      const candles = await fetchBirdeyeOneMinuteCandles(mint, capped);
       log("indicators_warn", `GeckoTerminal OHLCV failed (${error.message}) — using Birdeye fallback (${candles.length} candles)`);
       return candles;
     } catch (fallbackError) {
@@ -426,14 +471,19 @@ export async function checkOneMinuteVolume({ mint, poolAddress, scope } = {}) {
  * including the in-progress candle.
  */
 async function fetchOneMinuteVolumeRows(poolAddress, limit = 5) {
+  const cacheKey = `gt:1m:usd:${poolAddress}:${limit}`;
+  const hit = candleCache.get(cacheKey);
+  if (hit && Date.now() - hit.fetchedAt < CANDLE_CACHE_TTL_MS) return hit.rows;
   const url = `${GECKO_TERMINAL_BASE}/networks/solana/pools/${poolAddress}/ohlcv/minute?aggregate=1&currency=usd&limit=${limit}`;
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`GeckoTerminal OHLCV failed (${res.status})`);
   const list = (await res.json())?.data?.attributes?.ohlcv_list || [];
   // ohlcv_list is newest-first: [time, open, high, low, close, volume]
-  return list
+  const rows = list
     .map(([time, , , , , volume]) => [Number(time), Number(volume)])
     .filter(([time, volume]) => Number.isFinite(time) && Number.isFinite(volume));
+  candleCache.set(cacheKey, { rows, fetchedAt: Date.now() });
+  return rows;
 }
 
 /**
