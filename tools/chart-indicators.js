@@ -291,24 +291,59 @@ async function fetchLocalOneMinutePayload(mint, poolAddress) {
 
 /**
  * Hard gate on 1-minute USD volume (mirrors the GMGN "vol 1m" reference).
- * Fetches the most recent 1m candles from GeckoTerminal (currency=usd → the
- * volume field is already USD-denominated, no price multiplication needed)
- * and requires BOTH the last completed candle AND the average of the last 3
- * completed candles to be >= config.indicators.minVolume1mUsd.
- * The in-progress (partial) candle is excluded so a deploy early in a minute
- * is not falsely rejected.
+ * Requires BOTH the last completed minute AND the average of the last 3
+ * completed minutes to be >= config.indicators.minVolume1mUsd.
  *
- * Note: GeckoTerminal only emits candles for minutes that had trades. To stay
- * faithful to "vol 1m", the most recent completed candle must also be fresh
- * (≤ 2 minutes old) — otherwise the token has simply gone quiet and the
- * stale candle's volume no longer reflects the current minute.
+ * Scope (config.indicators.volume1mScope):
+ * - "token" (default): GMGN-style token-wide volume — sums 1m candle volume
+ *   across ALL pools of the token (capped at the 5 highest-volume pools).
+ *   This matters because a token's activity often concentrates on one
+ *   market (e.g. a Raydium pool) while the Meteora DLMM pool stays quiet.
+ * - "pool": only the deploy pool's own 1m volume (strictest for fee capture,
+ *   but much lower numbers than GMGN shows).
+ *
+ * Data comes from GeckoTerminal with currency=usd, so the volume field is
+ * already USD-denominated. Minutes without trades count as $0 (GMGN-faithful:
+ * a quiet minute is low volume, not a skipped minute).
  */
-export async function checkOneMinuteVolume({ mint, poolAddress } = {}) {
+export async function checkOneMinuteVolume({ mint, poolAddress, scope } = {}) {
   const minVolume1mUsd = Number(config.indicators.minVolume1mUsd ?? 0);
   if (!(minVolume1mUsd > 0)) {
     return { enabled: false, ok: true, reason: "1m volume gate disabled" };
   }
 
+  const effectiveScope = String(scope || config.indicators.volume1mScope || "token").toLowerCase();
+
+  if (effectiveScope === "token") {
+    if (!mint) {
+      return { enabled: true, ok: false, reason: "token-scope 1m volume check needs a mint address" };
+    }
+    const pools = await fetchGtPoolsForMint(mint);
+    const top = pools.sort((a, b) => b.volumeH24Usd - a.volumeH24Usd).slice(0, 5);
+    if (top.length === 0) {
+      return {
+        enabled: true,
+        ok: false,
+        scope: "token",
+        lastVolumeUsd: 0,
+        avg3VolumeUsd: 0,
+        minVolume1mUsd,
+        reason: "no pools found for this token — cannot verify 1m volume",
+      };
+    }
+    const results = await Promise.allSettled(top.map((p) => fetchOneMinuteVolumeRows(p.address, 5)));
+    const volumesByMinute = new Map();
+    for (const entry of results) {
+      if (entry.status !== "fulfilled") continue;
+      for (const [timeSec, volumeUsd] of entry.value) {
+        if (!Number.isFinite(volumeUsd) || volumeUsd < 0) continue;
+        volumesByMinute.set(timeSec, (volumesByMinute.get(timeSec) || 0) + volumeUsd);
+      }
+    }
+    return evaluateOneMinuteVolumeGate(volumesByMinute, minVolume1mUsd, "token", top.length);
+  }
+
+  // Pool scope: only the deploy pool's own candles
   let resolvedPool = poolAddress || null;
   if (!resolvedPool) {
     if (!mint) {
@@ -316,68 +351,78 @@ export async function checkOneMinuteVolume({ mint, poolAddress } = {}) {
     }
     resolvedPool = await resolvePoolAddressByMint(mint);
   }
+  const rows = await fetchOneMinuteVolumeRows(resolvedPool, 5);
+  const volumesByMinute = new Map(rows.map(([timeSec, volumeUsd]) => [timeSec, volumeUsd]));
+  return evaluateOneMinuteVolumeGate(volumesByMinute, minVolume1mUsd, "pool", 1);
+}
 
-  const url = `${GECKO_TERMINAL_BASE}/networks/solana/pools/${resolvedPool}/ohlcv/minute?aggregate=1&currency=usd&limit=5`;
+/**
+ * Fetch recent 1-minute candles from GeckoTerminal (currency=usd → volume is
+ * already USD). Returns newest-first rows of [timestampSec, volumeUsd],
+ * including the in-progress candle.
+ */
+async function fetchOneMinuteVolumeRows(poolAddress, limit = 5) {
+  const url = `${GECKO_TERMINAL_BASE}/networks/solana/pools/${poolAddress}/ohlcv/minute?aggregate=1&currency=usd&limit=${limit}`;
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`GeckoTerminal OHLCV failed (${res.status})`);
-  const payload = await res.json();
+  const list = (await res.json())?.data?.attributes?.ohlcv_list || [];
   // ohlcv_list is newest-first: [time, open, high, low, close, volume]
-  let list = payload?.data?.attributes?.ohlcv_list || [];
+  return list
+    .map(([time, , , , , volume]) => [Number(time), Number(volume)])
+    .filter(([time, volume]) => Number.isFinite(time) && Number.isFinite(volume));
+}
+
+/**
+ * All GeckoTerminal pools for a token mint, with their 24h USD volume
+ * (used to pick the highest-volume markets for the token-wide 1m check).
+ */
+async function fetchGtPoolsForMint(mint) {
+  const url = `${GECKO_TERMINAL_BASE}/networks/solana/tokens/${mint}/pools`;
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!res.ok) throw new Error(`GeckoTerminal token pools lookup failed (${res.status})`);
+  const data = (await res.json())?.data || [];
+  return data
+    .map((p) => {
+      const a = p?.attributes || {};
+      return { address: a.address, name: a.name, volumeH24Usd: Number(a.volume_usd?.h24) || 0 };
+    })
+    .filter((p) => p.address);
+}
+
+/**
+ * Shared gate evaluation over per-minute USD volume totals.
+ * The last 3 completed minute slots are used (the in-progress minute is
+ * excluded so a deploy early in a minute is not judged on partial data).
+ * Minutes with no trades count as $0.
+ */
+function evaluateOneMinuteVolumeGate(volumesByMinute, minVolume1mUsd, scope, poolsChecked) {
   const nowSec = Date.now() / 1000;
-  // Drop the in-progress candle (timestamp within the current minute)
-  if (list.length > 0 && Number(list[0][0]) + 60 > nowSec) list = list.slice(1);
-
-  if (list.length === 0) {
-    return {
-      enabled: true,
-      ok: false,
-      lastVolumeUsd: 0,
-      avg3VolumeUsd: 0,
-      minVolume1mUsd,
-      reason: `no completed 1-minute candles — no recent trades (needs >= $${minVolume1mUsd.toLocaleString("en-US")}/min)`,
-    };
-  }
-
-  // Staleness guard: the newest completed candle must be recent
-  const lastCandleAgeSec = nowSec - Number(list[0][0]);
-  if (lastCandleAgeSec > 120) {
-    return {
-      enabled: true,
-      ok: false,
-      lastVolumeUsd: 0,
-      avg3VolumeUsd: 0,
-      minVolume1mUsd,
-      reason: `no trades in the last ${Math.round(lastCandleAgeSec / 60)} minutes — too quiet for fast in/out (needs >= $${minVolume1mUsd.toLocaleString("en-US")}/min)`,
-    };
-  }
-
-  // With currency=usd the volume field is already in USD
-  const volumesUsd = list
-    .slice(0, 3)
-    .map(([, , , , , volume]) => Number(volume))
-    .filter((v) => Number.isFinite(v) && v >= 0);
-
-  if (volumesUsd.length === 0) {
-    return {
-      enabled: true,
-      ok: false,
-      reason: "no completed 1-minute candles with volume data available",
-      minVolume1mUsd,
-    };
-  }
-
-  const lastVolumeUsd = volumesUsd[0];
-  const avg3VolumeUsd = volumesUsd.reduce((a, b) => a + b, 0) / volumesUsd.length;
+  const currentMinuteStart = Math.floor(nowSec / 60) * 60;
+  const slots = [currentMinuteStart - 60, currentMinuteStart - 120, currentMinuteStart - 180];
+  const slotVolumes = slots.map((slot) => volumesByMinute.get(slot) || 0);
+  const lastVolumeUsd = slotVolumes[0];
+  const avg3VolumeUsd = (slotVolumes[0] + slotVolumes[1] + slotVolumes[2]) / 3;
   const ok = lastVolumeUsd >= minVolume1mUsd && avg3VolumeUsd >= minVolume1mUsd;
+
+  const newestCandleSec = volumesByMinute.size > 0 ? Math.max(...volumesByMinute.keys()) : null;
+  let reason;
+  if (ok) {
+    reason = `1m volume OK (${scope}): last $${Math.round(lastVolumeUsd).toLocaleString("en-US")}, avg3 $${Math.round(avg3VolumeUsd).toLocaleString("en-US")} >= $${minVolume1mUsd.toLocaleString("en-US")}`;
+  } else if (newestCandleSec != null && nowSec - newestCandleSec > 180 && lastVolumeUsd === 0) {
+    reason = `no trades in the last ${Math.round((nowSec - newestCandleSec) / 60)} minutes (${scope}) — too quiet for fast in/out (needs >= $${minVolume1mUsd.toLocaleString("en-US")}/min)`;
+  } else {
+    reason = `1m volume too low (${scope}): last $${Math.round(lastVolumeUsd).toLocaleString("en-US")}, avg3 $${Math.round(avg3VolumeUsd).toLocaleString("en-US")} — both must be >= $${minVolume1mUsd.toLocaleString("en-US")} (token is too illiquid for fast in/out)`;
+  }
+
   return {
     enabled: true,
     ok,
+    scope,
+    poolsChecked,
     lastVolumeUsd,
     avg3VolumeUsd,
     minVolume1mUsd,
-    reason: ok
-      ? `1m volume OK: last $${Math.round(lastVolumeUsd).toLocaleString("en-US")}, avg3 $${Math.round(avg3VolumeUsd).toLocaleString("en-US")} >= $${minVolume1mUsd.toLocaleString("en-US")}`
-      : `1m volume too low: last $${Math.round(lastVolumeUsd).toLocaleString("en-US")}, avg3 $${Math.round(avg3VolumeUsd).toLocaleString("en-US")} — both must be >= $${minVolume1mUsd.toLocaleString("en-US")} (token is too illiquid for fast in/out)`,
+    reason,
   };
 }
 

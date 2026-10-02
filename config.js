@@ -315,10 +315,13 @@ export const config = {
     maxCandleAgeIntervals: indicatorUserConfig.maxCandleAgeIntervals ?? 3,
     maxSpikePct: indicatorUserConfig.maxSpikePct ?? 20,
     maxEntryRsi: indicatorUserConfig.maxEntryRsi ?? 95,
-    // Minimum USD volume on the 1-minute timeframe (last completed candle AND
-    // average of the last 3 completed candles must both pass). 0 = disabled.
+    // Minimum USD volume on the 1-minute timeframe (last completed minute AND
+    // average of the last 3 completed minutes must both pass). 0 = disabled.
     // Mirrors the GMGN "vol 1m" reference for fast in/out strategies.
     minVolume1mUsd: indicatorUserConfig.minVolume1mUsd ?? 30_000,
+    // Where the 1m volume is measured: "token" = GMGN-style token-wide across
+    // all markets; "pool" = only the deploy pool itself.
+    volume1mScope: indicatorUserConfig.volume1mScope ?? "token",
   },
 };
 
