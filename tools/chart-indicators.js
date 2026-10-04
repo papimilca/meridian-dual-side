@@ -154,6 +154,13 @@ async function fetchOneMinuteCandles(poolAddress, limit) {
     .reverse();
 }
 
+const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+function assertMintAddress(mint, source = "GeckoTerminal") {
+  if (typeof mint !== "string" || !SOLANA_ADDRESS_RE.test(mint)) {
+    throw new Error(`invalid base mint for ${source} (got "${mint}" — expected a Solana address; symbol/ticker is not accepted)`);
+  }
+}
+
 /**
  * Birdeye OHLCV fallback (token mint, 1m, USD-denominated). Used when the
  * public GeckoTerminal endpoint is rate-limited (429) or unavailable so that
@@ -187,6 +194,7 @@ async function birdeyeFetch(url) {
 async function fetchBirdeyeOneMinuteCandles(mint, limit) {
   if (!config.indicators.birdeyeApiKey) throw new Error("Birdeye fallback not configured (indicators.birdeyeApiKey missing)");
   if (!mint) throw new Error("Birdeye fallback needs a mint address");
+  assertMintAddress(mint, "Birdeye");
   const capped = Math.min(Math.max(Number(limit) || DEFAULT_CANDLES, 10), 1000);
   const cacheKey = `birdeye:1m:${mint}:${capped}`;
   const hit = candleCache.get(cacheKey);
@@ -491,6 +499,7 @@ async function fetchOneMinuteVolumeRows(poolAddress, limit = 5) {
  * (used to pick the highest-volume markets for the token-wide 1m check).
  */
 async function fetchGtPoolsForMint(mint) {
+  assertMintAddress(mint, "GeckoTerminal");
   const url = `${GECKO_TERMINAL_BASE}/networks/solana/tokens/${mint}/pools`;
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`GeckoTerminal token pools lookup failed (${res.status})`);

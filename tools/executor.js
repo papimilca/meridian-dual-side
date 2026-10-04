@@ -198,6 +198,19 @@ async function validateDeployPoolThresholds(args) {
   return { pass: true, entryMarketData, baseMint };
 }
 
+/**
+ * Pick a valid base mint address for external API calls (GeckoTerminal/Birdeye).
+ * args.base_mint comes from the LLM and may be a symbol (e.g. "FROG") — those
+ * APIs reject anything that is not a base58 Solana address ("address is
+ * invalid format"). The pool-detail mint is authoritative, so it wins;
+ * args.base_mint is only used when it is address-shaped.
+ */
+const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+function resolveBaseMint(...candidates) {
+  const valid = candidates.find((c) => typeof c === "string" && SOLANA_ADDRESS_RE.test(c));
+  return valid || candidates.find((c) => !!c) || null;
+}
+
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
 export function registerCronRestarter(fn) { _cronRestarter = fn; }
@@ -865,9 +878,12 @@ async function runSafetyChecks(name, args) {
 
       // Hard gate on 1-minute USD volume: refuse to deploy into tokens whose
       // recent per-minute trading volume is too low (illiquid for fast in/out).
+      // base_mint from the LLM can be a symbol, not an address — prefer the
+      // pool-detail mint (authoritative, on-chain) and only accept an
+      // address-shaped args.base_mint.
       const minVolume1mUsd = Number(config.indicators.minVolume1mUsd ?? 0);
       if (minVolume1mUsd > 0) {
-        const volMint = args.base_mint || poolThresholds.baseMint;
+        const volMint = resolveBaseMint(poolThresholds.baseMint, args.base_mint);
         try {
           const volumeCheck = await checkOneMinuteVolume({
             mint: volMint,
@@ -895,7 +911,7 @@ async function runSafetyChecks(name, args) {
       // or price is spiking (ATH). This closes the gap between screening
       // time and execution time.
       if (config.indicators.enabled) {
-        const baseMint = args.base_mint || poolThresholds.baseMint;
+        const baseMint = resolveBaseMint(poolThresholds.baseMint, args.base_mint);
         if (!baseMint) {
           return {
             pass: false,
